@@ -508,7 +508,7 @@ if page == "Budget Overview":
             fig_all.update_layout(**PLOTLY_LAYOUT, height=350,
                                   legend=dict(font=dict(size=11)))
             fig_all.update_traces(
-                textinfo="percent",
+                textinfo="none",
                 textposition="inside",
                 textfont_size=11,
                 hovertemplate="%{label}<br>$%{value:,.0f}<br>%{percent}<extra></extra>",
@@ -540,7 +540,7 @@ if page == "Budget Overview":
                     fig_drill.update_layout(**PLOTLY_LAYOUT, height=350,
                                             legend=dict(font=dict(size=11)))
                     fig_drill.update_traces(
-                        textinfo="label+value",
+                        textinfo="none",
                         texttemplate="%{label}<br>$%{value:,.0f}",
                         textposition="inside" if len(li_data) > 4 else "outside",
                         textfont_size=11,
