@@ -479,26 +479,55 @@ if page == "Budget Overview":
         fig_bar.update_traces(textposition="outside")
         st.plotly_chart(fig_bar, use_container_width=True)
 
-    # Pie chart
+    # Category drill-down
     with col_right:
-        st.subheader("Budget Distribution")
-        df_pie = df_filtered[["short_name", str(selected_year)]].copy()
-        df_pie.columns = ["Category", "Budget"]
-        df_pie = df_pie[df_pie["Budget"] > 0]
-        fig_pie = px.pie(
-            df_pie, values="Budget", names="Category",
-            color_discrete_sequence=COLORS,
-            hole=0.4,
+        st.subheader("Category Drill-Down")
+        # Build list of categories with budget > 0
+        drill_options = df_filtered[df_filtered[str(selected_year)] > 0][["account", "short_name", str(selected_year)]].copy()
+        drill_options.columns = ["account", "name", "budget"]
+        drill_options = drill_options.sort_values("budget", ascending=False)
+
+        drill_choice = st.selectbox(
+            "Select a category to see line items",
+            drill_options["name"].tolist(),
+            index=0,
         )
-        fig_pie.update_layout(**PLOTLY_LAYOUT, height=450,
-                              legend=dict(font=dict(size=11)))
-        fig_pie.update_traces(
-            textinfo="label+percent",
-            textposition="inside",
-            insidetextorientation="radial",
-            textfont_size=11,
-        )
-        st.plotly_chart(fig_pie, use_container_width=True)
+
+        # Find the account for this category
+        drill_acct = drill_options[drill_options["name"] == drill_choice]["account"].iloc[0]
+
+        if drill_acct in gl_data:
+            info = gl_data[drill_acct]
+            li_data = []
+            for li in info["line_items"]:
+                annual = li[f"annual_{selected_year}"]
+                if annual > 0:
+                    li_data.append({"Line Item": li["name"], "Budget": annual})
+
+            if li_data:
+                df_drill = pd.DataFrame(li_data).sort_values("Budget", ascending=False)
+                total = df_drill["Budget"].sum()
+
+                # Show total
+                st.metric(f"{drill_choice} Total", f"${total:,.0f}")
+
+                # Donut chart of line items within this category
+                fig_drill = px.pie(
+                    df_drill, values="Budget", names="Line Item",
+                    color_discrete_sequence=COLORS,
+                    hole=0.35,
+                )
+                fig_drill.update_layout(**PLOTLY_LAYOUT, height=350,
+                                        legend=dict(font=dict(size=11)))
+                fig_drill.update_traces(
+                    textinfo="label+value",
+                    texttemplate="%{label}<br>$%{value:,.0f}",
+                    textposition="inside" if len(li_data) > 4 else "outside",
+                    textfont_size=11,
+                )
+                st.plotly_chart(fig_drill, use_container_width=True)
+            else:
+                st.info("No line items with budget for this year.")
 
     # Year-over-year comparison
     st.subheader("Year-over-Year Comparison")
