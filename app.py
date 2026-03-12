@@ -2,11 +2,11 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import subprocess
 import csv
 import io
 import os
 import re
+import shutil
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -18,8 +18,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-DATA_DIR = os.path.dirname(os.path.abspath(__file__))
-XLSX2CSV = os.path.expanduser("~/.local/bin/xlsx2csv")
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 MONTHS = [f"{m:02d}" for m in range(1, 13)]
 MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -51,28 +50,66 @@ COLORS = px.colors.qualitative.Set3
 
 
 # ---------------------------------------------------------------------------
-# Data loading helpers
+# xlsx2csv helper – use Python API, fall back to CLI, then error
 # ---------------------------------------------------------------------------
-@st.cache_data
-def xlsx_to_rows(filepath: str) -> list[list[str]]:
-    """Convert an xlsx file to a list of rows using xlsx2csv."""
-    result = subprocess.run(
-        [XLSX2CSV, filepath],
-        capture_output=True, text=True, timeout=30,
-    )
-    reader = csv.reader(io.StringIO(result.stdout))
+def _xlsx_bytes_to_rows(file_bytes: bytes) -> list[list[str]]:
+    """Convert xlsx bytes to a list of CSV rows using xlsx2csv."""
+    try:
+        from xlsx2csv import Xlsx2csv
+    except ImportError:
+        # Try CLI fallback
+        xlsx2csv_bin = shutil.which("xlsx2csv")
+        if xlsx2csv_bin is None:
+            st.error(
+                "**xlsx2csv** is not installed. Install it with: "
+                "`pip install xlsx2csv`"
+            )
+            return []
+        import subprocess
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            tmp.write(file_bytes)
+            tmp_path = tmp.name
+        try:
+            result = subprocess.run(
+                [xlsx2csv_bin, tmp_path],
+                capture_output=True, text=True, timeout=30,
+            )
+            reader = csv.reader(io.StringIO(result.stdout))
+            return list(reader)
+        finally:
+            os.unlink(tmp_path)
+
+    # Use Python API
+    buf = io.BytesIO(file_bytes)
+    out = io.StringIO()
+    Xlsx2csv(buf).convert(out)
+    out.seek(0)
+    reader = csv.reader(out)
     return list(reader)
 
 
-def parse_gl_file(filepath: str) -> dict:
-    """Parse a single GL account xlsx export.
+# ---------------------------------------------------------------------------
+# Data loading helpers
+# ---------------------------------------------------------------------------
+def _to_float(val: str) -> float:
+    try:
+        return float(val.replace(",", "").strip())
+    except (ValueError, AttributeError):
+        return 0.0
+
+
+def parse_gl_bytes(file_bytes: bytes) -> dict | None:
+    """Parse a single GL account xlsx export from bytes.
 
     Returns dict with keys:
         account   – e.g. '6623.18'
         desc      – full GL description from Line000
         line_items – list of dicts with name, annual, monthly, per year
     """
-    rows = xlsx_to_rows(filepath)
+    rows = _xlsx_bytes_to_rows(file_bytes)
+    if not rows:
+        return None
 
     account = None
     for r in rows:
@@ -134,32 +171,11 @@ def parse_gl_file(filepath: str) -> dict:
     }
 
 
-def _to_float(val: str) -> float:
-    try:
-        return float(val.replace(",", "").strip())
-    except (ValueError, AttributeError):
-        return 0.0
-
-
-@st.cache_data
-def load_all_gl_data() -> dict:
-    """Load all 12 GL xlsx files, returning dict keyed by account number."""
-    gl_files = [
-        f for f in os.listdir(DATA_DIR)
-        if f.endswith(".xlsx") and f != "Dept_44_Budget.xlsx"
-    ]
-    data = {}
-    for fname in sorted(gl_files):
-        parsed = parse_gl_file(os.path.join(DATA_DIR, fname))
-        if parsed:
-            data[parsed["account"]] = parsed
-    return data
-
-
-@st.cache_data
-def load_2025_actuals() -> pd.DataFrame:
+def parse_master_bytes(file_bytes: bytes) -> list[dict]:
     """Parse Dept_44_Budget.xlsx for 2025 budget vs actual data."""
-    rows = xlsx_to_rows(os.path.join(DATA_DIR, "Dept_44_Budget.xlsx"))
+    rows = _xlsx_bytes_to_rows(file_bytes)
+    if not rows:
+        return []
 
     records = []
     current_account = None
@@ -198,7 +214,6 @@ def load_2025_actuals() -> pd.DataFrame:
         # Detect sub-line items (no account number, name in col 0 or 1)
         if current_account and not r[0].strip():
             name = r[1].strip() if len(r) > 1 and r[1].strip() else ""
-            # Check col 0 too
             if not name:
                 name = r[0].strip()
             if not name:
@@ -230,7 +245,6 @@ def load_2025_actuals() -> pd.DataFrame:
                 "yearly_actual": yearly_actual,
             })
         elif r[0].strip() and not re.match(r"\d{4}\.\d{2}", r[0].strip()):
-            # Line item with name in col 0 (under current account)
             if current_account:
                 name = r[0].strip()
                 if name in ("Account", "Net Income"):
@@ -266,10 +280,123 @@ def category_label(account: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Load data
+# Data source: uploaded files or local data/ directory
 # ---------------------------------------------------------------------------
-gl_data = load_all_gl_data()
-actuals_2025 = load_2025_actuals()
+def _load_local_files() -> dict[str, bytes] | None:
+    """If xlsx files exist in data/ subdirectory, load them."""
+    if not os.path.isdir(DATA_DIR):
+        # Also check app root for backwards compat during migration
+        app_dir = os.path.dirname(os.path.abspath(__file__))
+        xlsx_in_root = [f for f in os.listdir(app_dir) if f.endswith(".xlsx")]
+        if xlsx_in_root:
+            return {f: open(os.path.join(app_dir, f), "rb").read() for f in xlsx_in_root}
+        return None
+    xlsx_files = [f for f in os.listdir(DATA_DIR) if f.endswith(".xlsx")]
+    if not xlsx_files:
+        return None
+    return {f: open(os.path.join(DATA_DIR, f), "rb").read() for f in xlsx_files}
+
+
+def _get_file_data() -> dict[str, bytes] | None:
+    """Return dict of filename->bytes from uploads or local files."""
+    if "uploaded_files" in st.session_state and st.session_state["uploaded_files"]:
+        return st.session_state["uploaded_files"]
+    return _load_local_files()
+
+
+def _process_files(file_data: dict[str, bytes]) -> tuple[dict, list]:
+    """Parse all files and return (gl_data dict, actuals_2025 list)."""
+    gl_data = {}
+    actuals_2025 = []
+
+    for fname, fbytes in sorted(file_data.items()):
+        if fname == "Dept_44_Budget.xlsx":
+            actuals_2025 = parse_master_bytes(fbytes)
+        else:
+            parsed = parse_gl_bytes(fbytes)
+            if parsed:
+                gl_data[parsed["account"]] = parsed
+
+    return gl_data, actuals_2025
+
+
+# ---------------------------------------------------------------------------
+# Sidebar: file uploader + navigation
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("### GVTC Department 44")
+    st.markdown("**Web Management**")
+    st.markdown("Entity: P0100")
+    st.divider()
+
+    # File uploader
+    uploaded = st.file_uploader(
+        "Upload GL Account xlsx files",
+        type=["xlsx"],
+        accept_multiple_files=True,
+        help="Upload your GVTC GL account Excel exports and the Dept_44_Budget.xlsx master file.",
+    )
+
+    if uploaded:
+        st.session_state["uploaded_files"] = {f.name: f.read() for f in uploaded}
+
+    # Show loaded file status
+    file_data = _get_file_data()
+    if file_data:
+        source = "uploaded" if "uploaded_files" in st.session_state and st.session_state["uploaded_files"] else "local"
+        st.caption(f"{len(file_data)} file(s) loaded ({source})")
+        with st.expander("Loaded files", expanded=False):
+            for fname in sorted(file_data.keys()):
+                st.text(f"  {fname}")
+        if st.button("Clear Data", type="secondary"):
+            st.session_state.pop("uploaded_files", None)
+            st.rerun()
+
+    st.divider()
+
+
+# ---------------------------------------------------------------------------
+# Welcome page when no data is loaded
+# ---------------------------------------------------------------------------
+if file_data is None:
+    st.title("GVTC Dept 44 – Budget Dashboard")
+    st.markdown("---")
+    st.markdown(
+        """
+        ### Welcome
+
+        No budget data is currently loaded. To get started, upload your GVTC
+        GL account Excel exports using the **file uploader in the sidebar**.
+
+        **Expected files:**
+        - **Individual GL account exports** (e.g. `Contract_labor_and_services.xlsx`,
+          `Cellular_phone.xlsx`, `GPC_Software_licenses.xlsx`, etc.)
+          — one file per GL account with line-item budget details for 2026-2028.
+        - **Master budget file** (`Dept_44_Budget.xlsx`)
+          — contains 2025 budget vs actuals data across all categories.
+
+        **File format:** Standard GVTC budget Excel exports with account numbers,
+        line items, and monthly/annual budget columns. The parser expects the
+        standard layout with an "Account" field and "Line Item" headers.
+
+        **Local development:** Place xlsx files in a `data/` subdirectory and
+        they will be loaded automatically.
+        """
+    )
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
+# Load & process data
+# ---------------------------------------------------------------------------
+gl_data, actuals_2025 = _process_files(file_data)
+
+if not gl_data:
+    st.warning(
+        "No valid GL account data found in the uploaded files. "
+        "Please check that you uploaded the correct GVTC budget xlsx exports."
+    )
+    st.stop()
 
 # Build summary DataFrames
 summary_rows = []
@@ -289,14 +416,9 @@ for acct, info in sorted(gl_data.items()):
 df_summary = pd.DataFrame(summary_rows)
 
 # ---------------------------------------------------------------------------
-# Sidebar
+# Sidebar: navigation & filters (continued)
 # ---------------------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### GVTC Department 44")
-    st.markdown("**Web Management**")
-    st.markdown("Entity: P0100")
-    st.divider()
-
     page = st.radio(
         "Navigate",
         ["Budget Overview", "Monthly View", "Line Item Detail", "2025 Actuals"],
@@ -583,7 +705,7 @@ elif page == "2025 Actuals":
     st.title("2025 Budget vs Actuals")
 
     if not actuals_2025:
-        st.warning("Could not load 2025 actuals data.")
+        st.warning("Could not load 2025 actuals data. Make sure Dept_44_Budget.xlsx is included.")
     else:
         # Category-level summary
         cat_records = [r for r in actuals_2025 if r["is_category"]]
@@ -628,7 +750,6 @@ elif page == "2025 Actuals":
             df_bva = df_var[["Category", "Budget", "Actual"]].melt(
                 id_vars="Category", var_name="Type", value_name="Amount"
             )
-            # Shorten category names
             df_bva["Category"] = df_bva["Category"].str.replace(
                 r"^CC - |^GP Comp - ", "", regex=True
             ).str[:35]
