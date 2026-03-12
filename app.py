@@ -7,6 +7,14 @@ import io
 import os
 import re
 import shutil
+import base64
+import json
+
+try:
+    from streamlit_local_storage import LocalStorage
+    HAS_LOCAL_STORAGE = True
+except ImportError:
+    HAS_LOCAL_STORAGE = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -297,10 +305,44 @@ def _load_local_files() -> dict[str, bytes] | None:
     return {f: open(os.path.join(DATA_DIR, f), "rb").read() for f in xlsx_files}
 
 
-def _get_file_data() -> dict[str, bytes] | None:
-    """Return dict of filename->bytes from uploads or local files."""
+LOCAL_STORAGE_KEY = "gvtc_budget_files"
+
+
+def _save_to_local_storage(localS, file_data: dict[str, bytes]):
+    """Save file data to browser localStorage as base64."""
+    if not HAS_LOCAL_STORAGE or localS is None:
+        return
+    encoded = {}
+    for fname, fbytes in file_data.items():
+        encoded[fname] = base64.b64encode(fbytes).decode("ascii")
+    localS.setItem(LOCAL_STORAGE_KEY, json.dumps(encoded))
+
+
+def _load_from_local_storage(localS) -> dict[str, bytes] | None:
+    """Load file data from browser localStorage."""
+    if not HAS_LOCAL_STORAGE or localS is None:
+        return None
+    raw = localS.getItem(LOCAL_STORAGE_KEY)
+    if not raw:
+        return None
+    try:
+        if isinstance(raw, str):
+            encoded = json.loads(raw)
+        else:
+            encoded = raw
+        return {fname: base64.b64decode(b64str) for fname, b64str in encoded.items()}
+    except Exception:
+        return None
+
+
+def _get_file_data(localS=None) -> dict[str, bytes] | None:
+    """Return dict of filename->bytes from uploads, localStorage, or local files."""
     if "uploaded_files" in st.session_state and st.session_state["uploaded_files"]:
         return st.session_state["uploaded_files"]
+    # Try localStorage
+    ls_data = _load_from_local_storage(localS)
+    if ls_data:
+        return ls_data
     return _load_local_files()
 
 
@@ -323,6 +365,8 @@ def _process_files(file_data: dict[str, bytes]) -> tuple[dict, list]:
 # ---------------------------------------------------------------------------
 # Sidebar: file uploader + navigation
 # ---------------------------------------------------------------------------
+localS = LocalStorage() if HAS_LOCAL_STORAGE else None
+
 with st.sidebar:
     st.markdown("### GVTC Department 44")
     st.markdown("**Web Management**")
@@ -334,22 +378,31 @@ with st.sidebar:
         "Upload GL Account xlsx files",
         type=["xlsx"],
         accept_multiple_files=True,
-        help="Upload your GVTC GL account Excel exports and the Dept_44_Budget.xlsx master file.",
     )
 
     if uploaded:
-        st.session_state["uploaded_files"] = {f.name: f.read() for f in uploaded}
+        file_dict = {f.name: f.read() for f in uploaded}
+        st.session_state["uploaded_files"] = file_dict
+        _save_to_local_storage(localS, file_dict)
 
     # Show loaded file status
-    file_data = _get_file_data()
+    file_data = _get_file_data(localS)
     if file_data:
-        source = "uploaded" if "uploaded_files" in st.session_state and st.session_state["uploaded_files"] else "local"
-        st.caption(f"{len(file_data)} file(s) loaded ({source})")
+        source = "uploaded"
+        if "uploaded_files" not in st.session_state or not st.session_state.get("uploaded_files"):
+            ls_data = _load_from_local_storage(localS)
+            if ls_data:
+                source = "saved"
+            else:
+                source = "local"
+        st.caption(f"📁 {len(file_data)} file(s) loaded ({source})")
         with st.expander("Loaded files", expanded=False):
             for fname in sorted(file_data.keys()):
                 st.text(f"  {fname}")
         if st.button("Clear Data", type="secondary"):
             st.session_state.pop("uploaded_files", None)
+            if localS:
+                localS.deleteItem(LOCAL_STORAGE_KEY)
             st.rerun()
 
     st.divider()
