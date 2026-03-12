@@ -7,14 +7,6 @@ import io
 import os
 import re
 import shutil
-import base64
-import json
-
-try:
-    from streamlit_local_storage import LocalStorage
-    HAS_LOCAL_STORAGE = True
-except ImportError:
-    HAS_LOCAL_STORAGE = False
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -25,8 +17,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
 MONTHS = [f"{m:02d}" for m in range(1, 13)]
 MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -55,6 +45,8 @@ PLOTLY_LAYOUT = dict(
 )
 
 COLORS = px.colors.qualitative.Set3
+
+MASTER_FILE_NAME = "Dept 44 Budget"
 
 
 # ---------------------------------------------------------------------------
@@ -288,62 +280,68 @@ def category_label(account: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Data source: uploaded files or local data/ directory
+# Google Drive data source
 # ---------------------------------------------------------------------------
-def _load_local_files() -> dict[str, bytes] | None:
-    """If xlsx files exist in data/ subdirectory, load them."""
-    if not os.path.isdir(DATA_DIR):
-        # Also check app root for backwards compat during migration
-        app_dir = os.path.dirname(os.path.abspath(__file__))
-        xlsx_in_root = [f for f in os.listdir(app_dir) if f.endswith(".xlsx")]
-        if xlsx_in_root:
-            return {f: open(os.path.join(app_dir, f), "rb").read() for f in xlsx_in_root}
-        return None
-    xlsx_files = [f for f in os.listdir(DATA_DIR) if f.endswith(".xlsx")]
-    if not xlsx_files:
-        return None
-    return {f: open(os.path.join(DATA_DIR, f), "rb").read() for f in xlsx_files}
+def _build_drive_service():
+    """Build an authenticated Google Drive API service from st.secrets."""
+    from google.oauth2.credentials import Credentials
+    from googleapiclient.discovery import build
+
+    creds = Credentials(
+        token=None,
+        refresh_token=st.secrets["google_drive"]["refresh_token"],
+        client_id=st.secrets["google_drive"]["client_id"],
+        client_secret=st.secrets["google_drive"]["client_secret"],
+        token_uri=st.secrets["google_drive"]["token_uri"],
+    )
+    return build("drive", "v3", credentials=creds)
 
 
-LOCAL_STORAGE_KEY = "gvtc_budget_files"
+@st.cache_data(ttl=300)
+def load_drive_data() -> tuple[dict, list]:
+    """Load all budget files from Google Drive folder, parse, and return (gl_data, actuals_2025).
 
+    Cached for 5 minutes.
+    """
+    folder_id = st.secrets["google_drive"]["folder_id"]
+    service = _build_drive_service()
 
-def _save_to_local_storage(localS, file_data: dict[str, bytes]):
-    """Save file data to browser localStorage as base64."""
-    if not HAS_LOCAL_STORAGE or localS is None:
-        return
-    encoded = {}
-    for fname, fbytes in file_data.items():
-        encoded[fname] = base64.b64encode(fbytes).decode("ascii")
-    localS.setItem(LOCAL_STORAGE_KEY, json.dumps(encoded))
+    # List all files in the folder
+    results = service.files().list(
+        q=f"'{folder_id}' in parents and trashed = false",
+        fields="files(id, name, mimeType)",
+        pageSize=100,
+    ).execute()
+    files = results.get("files", [])
 
+    gl_data = {}
+    actuals_2025 = []
+    export_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-def _load_from_local_storage(localS) -> dict[str, bytes] | None:
-    """Load file data from browser localStorage."""
-    if not HAS_LOCAL_STORAGE or localS is None:
-        return None
-    raw = localS.getItem(LOCAL_STORAGE_KEY)
-    if not raw:
-        return None
-    try:
-        if isinstance(raw, str):
-            encoded = json.loads(raw)
+    for f in files:
+        name = f["name"]
+        file_id = f["id"]
+        mime = f["mimeType"]
+
+        # Export Google Sheets as xlsx; download xlsx files directly
+        if mime == "application/vnd.google-apps.spreadsheet":
+            resp = service.files().export(fileId=file_id, mimeType=export_mime).execute()
+        elif mime == export_mime:
+            resp = service.files().get_media(fileId=file_id).execute()
         else:
-            encoded = raw
-        return {fname: base64.b64decode(b64str) for fname, b64str in encoded.items()}
-    except Exception:
-        return None
+            continue
 
+        file_bytes = resp if isinstance(resp, bytes) else resp.encode("latin-1")
 
-def _get_file_data(localS=None) -> dict[str, bytes] | None:
-    """Return dict of filename->bytes from uploads, localStorage, or local files."""
-    if "uploaded_files" in st.session_state and st.session_state["uploaded_files"]:
-        return st.session_state["uploaded_files"]
-    # Try localStorage
-    ls_data = _load_from_local_storage(localS)
-    if ls_data:
-        return ls_data
-    return _load_local_files()
+        # Determine if this is the master budget file
+        if MASTER_FILE_NAME.lower() in name.lower():
+            actuals_2025 = parse_master_bytes(file_bytes)
+        else:
+            parsed = parse_gl_bytes(file_bytes)
+            if parsed:
+                gl_data[parsed["account"]] = parsed
+
+    return gl_data, actuals_2025
 
 
 def _process_files(file_data: dict[str, bytes]) -> tuple[dict, list]:
@@ -363,91 +361,41 @@ def _process_files(file_data: dict[str, bytes]) -> tuple[dict, list]:
 
 
 # ---------------------------------------------------------------------------
-# Sidebar: file uploader + navigation
+# Sidebar: department info + navigation
 # ---------------------------------------------------------------------------
-localS = LocalStorage() if HAS_LOCAL_STORAGE else None
-
 with st.sidebar:
     st.markdown("### GVTC Department 44")
     st.markdown("**Web Management**")
     st.markdown("Entity: P0100")
     st.divider()
 
-    # File uploader
-    uploaded = st.file_uploader(
-        "Upload GL Account xlsx files",
-        type=["xlsx"],
-        accept_multiple_files=True,
-    )
-
-    if uploaded:
-        file_dict = {f.name: f.read() for f in uploaded}
-        st.session_state["uploaded_files"] = file_dict
-        _save_to_local_storage(localS, file_dict)
-
-    # Show loaded file status
-    file_data = _get_file_data(localS)
-    if file_data:
-        source = "uploaded"
-        if "uploaded_files" not in st.session_state or not st.session_state.get("uploaded_files"):
-            ls_data = _load_from_local_storage(localS)
-            if ls_data:
-                source = "saved"
-            else:
-                source = "local"
-        st.caption(f"📁 {len(file_data)} file(s) loaded ({source})")
-        with st.expander("Loaded files", expanded=False):
-            for fname in sorted(file_data.keys()):
-                st.text(f"  {fname}")
-        if st.button("Clear Data", type="secondary"):
-            st.session_state.pop("uploaded_files", None)
-            if localS:
-                localS.deleteItem(LOCAL_STORAGE_KEY)
-            st.rerun()
-
-    st.divider()
-
-
 # ---------------------------------------------------------------------------
-# Welcome page when no data is loaded
+# Load data from Google Drive
 # ---------------------------------------------------------------------------
-if file_data is None:
-    st.title("GVTC Dept 44 – Budget Dashboard")
-    st.markdown("---")
-    st.markdown(
-        """
-        ### Welcome
+try:
+    _ = st.secrets["google_drive"]
+    has_secrets = True
+except (KeyError, FileNotFoundError):
+    has_secrets = False
 
-        No budget data is currently loaded. To get started, upload your GVTC
-        GL account Excel exports using the **file uploader in the sidebar**.
-
-        **Expected files:**
-        - **Individual GL account exports** (e.g. `Contract_labor_and_services.xlsx`,
-          `Cellular_phone.xlsx`, `GPC_Software_licenses.xlsx`, etc.)
-          — one file per GL account with line-item budget details for 2026-2028.
-        - **Master budget file** (`Dept_44_Budget.xlsx`)
-          — contains 2025 budget vs actuals data across all categories.
-
-        **File format:** Standard GVTC budget Excel exports with account numbers,
-        line items, and monthly/annual budget columns. The parser expects the
-        standard layout with an "Account" field and "Line Item" headers.
-
-        **Local development:** Place xlsx files in a `data/` subdirectory and
-        they will be loaded automatically.
-        """
+if not has_secrets:
+    st.error(
+        "**Google Drive credentials not configured.** "
+        "Add `[google_drive]` section to `.streamlit/secrets.toml` or Streamlit Cloud secrets "
+        "with `refresh_token`, `client_id`, `client_secret`, `token_uri`, and `folder_id`."
     )
     st.stop()
 
-
-# ---------------------------------------------------------------------------
-# Load & process data
-# ---------------------------------------------------------------------------
-gl_data, actuals_2025 = _process_files(file_data)
+try:
+    gl_data, actuals_2025 = load_drive_data()
+except Exception as e:
+    st.error(f"**Failed to load data from Google Drive:** {e}")
+    st.stop()
 
 if not gl_data:
     st.warning(
-        "No valid GL account data found in the uploaded files. "
-        "Please check that you uploaded the correct GVTC budget xlsx exports."
+        "No valid GL account data found in the Google Drive folder. "
+        "Please check that the folder contains the correct GVTC budget files."
     )
     st.stop()
 
@@ -472,6 +420,12 @@ df_summary = pd.DataFrame(summary_rows)
 # Sidebar: navigation & filters (continued)
 # ---------------------------------------------------------------------------
 with st.sidebar:
+    if st.button("🔄 Refresh Data"):
+        load_drive_data.clear()
+        st.rerun()
+
+    st.divider()
+
     page = st.radio(
         "Navigate",
         ["Budget Overview", "Monthly View", "Line Item Detail", "2025 Actuals"],
@@ -813,7 +767,7 @@ elif page == "2025 Actuals":
     st.title("2025 Budget vs Actuals")
 
     if not actuals_2025:
-        st.warning("Could not load 2025 actuals data. Make sure Dept_44_Budget.xlsx is included.")
+        st.warning("Could not load 2025 actuals data. Make sure the 'Dept 44 Budget' file is in the Google Drive folder.")
     else:
         # Category-level summary
         cat_records = [r for r in actuals_2025 if r["is_category"]]
