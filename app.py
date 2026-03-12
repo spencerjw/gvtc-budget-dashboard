@@ -487,47 +487,67 @@ if page == "Budget Overview":
         drill_options.columns = ["account", "name", "budget"]
         drill_options = drill_options.sort_values("budget", ascending=False)
 
+        drill_choices = ["All Categories"] + drill_options["name"].tolist()
         drill_choice = st.selectbox(
             "Select a category to see line items",
-            drill_options["name"].tolist(),
+            drill_choices,
             index=0,
         )
 
-        # Find the account for this category
-        drill_acct = drill_options[drill_options["name"] == drill_choice]["account"].iloc[0]
+        if drill_choice == "All Categories":
+            # Show overall distribution donut
+            df_pie = drill_options[["name", "budget"]].copy()
+            df_pie.columns = ["Category", "Budget"]
+            total = df_pie["Budget"].sum()
+            st.metric("Total Budget", f"${total:,.0f}")
+            fig_all = px.pie(
+                df_pie, values="Budget", names="Category",
+                color_discrete_sequence=COLORS,
+                hole=0.35,
+            )
+            fig_all.update_layout(**PLOTLY_LAYOUT, height=350,
+                                  legend=dict(font=dict(size=11)))
+            fig_all.update_traces(
+                textinfo="percent",
+                textposition="inside",
+                textfont_size=11,
+                hovertemplate="%{label}<br>$%{value:,.0f}<br>%{percent}<extra></extra>",
+            )
+            st.plotly_chart(fig_all, use_container_width=True)
+        else:
+            # Drill into specific category
+            drill_acct = drill_options[drill_options["name"] == drill_choice]["account"].iloc[0]
 
-        if drill_acct in gl_data:
-            info = gl_data[drill_acct]
-            li_data = []
-            for li in info["line_items"]:
-                annual = li[f"annual_{selected_year}"]
-                if annual > 0:
-                    li_data.append({"Line Item": li["name"], "Budget": annual})
+            if drill_acct in gl_data:
+                info = gl_data[drill_acct]
+                li_data = []
+                for li in info["line_items"]:
+                    annual = li[f"annual_{selected_year}"]
+                    if annual > 0:
+                        li_data.append({"Line Item": li["name"], "Budget": annual})
 
-            if li_data:
-                df_drill = pd.DataFrame(li_data).sort_values("Budget", ascending=False)
-                total = df_drill["Budget"].sum()
+                if li_data:
+                    df_drill = pd.DataFrame(li_data).sort_values("Budget", ascending=False)
+                    total = df_drill["Budget"].sum()
 
-                # Show total
-                st.metric(f"{drill_choice} Total", f"${total:,.0f}")
+                    st.metric(f"{drill_choice} Total", f"${total:,.0f}")
 
-                # Donut chart of line items within this category
-                fig_drill = px.pie(
-                    df_drill, values="Budget", names="Line Item",
-                    color_discrete_sequence=COLORS,
-                    hole=0.35,
-                )
-                fig_drill.update_layout(**PLOTLY_LAYOUT, height=350,
-                                        legend=dict(font=dict(size=11)))
-                fig_drill.update_traces(
-                    textinfo="label+value",
-                    texttemplate="%{label}<br>$%{value:,.0f}",
-                    textposition="inside" if len(li_data) > 4 else "outside",
-                    textfont_size=11,
-                )
-                st.plotly_chart(fig_drill, use_container_width=True)
-            else:
-                st.info("No line items with budget for this year.")
+                    fig_drill = px.pie(
+                        df_drill, values="Budget", names="Line Item",
+                        color_discrete_sequence=COLORS,
+                        hole=0.35,
+                    )
+                    fig_drill.update_layout(**PLOTLY_LAYOUT, height=350,
+                                            legend=dict(font=dict(size=11)))
+                    fig_drill.update_traces(
+                        textinfo="label+value",
+                        texttemplate="%{label}<br>$%{value:,.0f}",
+                        textposition="inside" if len(li_data) > 4 else "outside",
+                        textfont_size=11,
+                    )
+                    st.plotly_chart(fig_drill, use_container_width=True)
+                else:
+                    st.info("No line items with budget for this year.")
 
     # Year-over-year comparison
     st.subheader("Year-over-Year Comparison")
