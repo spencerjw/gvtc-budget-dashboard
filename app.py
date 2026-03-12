@@ -153,8 +153,8 @@ def parse_gl_bytes(file_bytes: bytes) -> dict | None:
             continue
 
         monthly_2026 = [_to_float(r[9 + i]) if len(r) > 9 + i else 0.0 for i in range(12)]
-        annual_2027 = _to_float(r[22]) if len(r) > 22 else 0.0
-        annual_2028 = _to_float(r[25]) if len(r) > 25 else 0.0
+        annual_2027 = _to_float(r[23]) if len(r) > 23 else 0.0
+        annual_2028 = _to_float(r[26]) if len(r) > 26 else 0.0
 
         line_items.append({
             "name": name,
@@ -490,8 +490,14 @@ if page == "Budget Overview":
             color_discrete_sequence=COLORS,
             hole=0.4,
         )
-        fig_pie.update_layout(**PLOTLY_LAYOUT, height=450)
-        fig_pie.update_traces(textinfo="label+percent", textposition="outside")
+        fig_pie.update_layout(**PLOTLY_LAYOUT, height=450,
+                              legend=dict(font=dict(size=11)))
+        fig_pie.update_traces(
+            textinfo="label+percent",
+            textposition="inside",
+            insidetextorientation="radial",
+            textfont_size=11,
+        )
         st.plotly_chart(fig_pie, use_container_width=True)
 
     # Year-over-year comparison
