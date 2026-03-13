@@ -279,6 +279,12 @@ def category_label(account: str) -> str:
     return f"{account} – {name}"
 
 
+def li_annual(li: dict, year: int) -> float:
+    """Get annual amount for a line item, safe for any year."""
+    key = f"annual_{year}"
+    return li.get(key, 0.0)
+
+
 # ---------------------------------------------------------------------------
 # Google Drive data source
 # ---------------------------------------------------------------------------
@@ -540,12 +546,18 @@ if page == "Budget Overview":
             drill_acct = drill_options[drill_options["name"] == drill_choice]["account"].iloc[0]
 
             if drill_acct in gl_data:
-                info = gl_data[drill_acct]
                 li_data = []
-                for li in info["line_items"]:
-                    annual = li[f"annual_{selected_year}"]
-                    if annual > 0:
-                        li_data.append({"Line Item": li["name"], "Budget": annual})
+                if selected_year == 2025:
+                    acct_items = [r for r in actuals_2025 if r["account"] == drill_acct and not r["is_category"]]
+                    for r in acct_items:
+                        if r["yearly_actual"] > 0:
+                            li_data.append({"Line Item": r["line_item"], "Budget": r["yearly_actual"]})
+                else:
+                    info = gl_data[drill_acct]
+                    for li in info["line_items"]:
+                        annual = li_annual(li, selected_year)
+                        if annual > 0:
+                            li_data.append({"Line Item": li["name"], "Budget": annual})
 
                 if li_data:
                     df_drill = pd.DataFrame(li_data).sort_values("Budget", ascending=False)
@@ -600,13 +612,18 @@ elif page == "Monthly View":
             continue
         info = gl_data[acct]
         monthly_totals = [0.0] * 12
-        for li in info["line_items"]:
-            if selected_year == 2026:
+        if selected_year == 2025:
+            # Use actuals from master file
+            acct_data = actuals_by_account.get(acct, {})
+            monthly_totals = list(acct_data.get("monthly_actual", [0.0] * 12))
+        elif selected_year == 2026:
+            for li in info["line_items"]:
                 for m in range(12):
                     monthly_totals[m] += li["monthly_2026"][m]
-            else:
+        else:
+            for li in info["line_items"]:
                 # 2027/2028 only have annual totals, spread evenly
-                annual = li[f"annual_{selected_year}"]
+                annual = li_annual(li, selected_year)
                 for m in range(12):
                     monthly_totals[m] += annual / 12
         for m in range(12):
@@ -674,31 +691,47 @@ elif page == "Line Item Detail":
             continue
         info = gl_data[acct]
         label = category_label(acct)
-        total = sum(li[f"annual_{selected_year}"] for li in info["line_items"])
+        if selected_year == 2025:
+            acct_actual = actuals_by_account.get(acct, {}).get("actual", 0)
+            total = acct_actual
+        else:
+            total = sum(li_annual(li, selected_year) for li in info["line_items"])
 
         with st.expander(f"{label}  —  ${total:,.0f}", expanded=False):
             rows = []
-            for li in info["line_items"]:
-                annual = li[f"annual_{selected_year}"]
-                if annual == 0 and not li["name"]:
-                    continue
-                row = {"Line Item": li["name"], "Annual": annual}
-                if selected_year == 2026:
-                    for m in range(12):
-                        row[MONTH_LABELS[m]] = li["monthly_2026"][m]
-                else:
-                    for m in range(12):
-                        row[MONTH_LABELS[m]] = annual / 12
 
-                # YoY change
-                prev_year = selected_year - 1
-                if prev_year >= 2026:
-                    prev = li[f"annual_{prev_year}"]
-                    change = annual - prev
-                    row["YoY Change"] = change
-                elif selected_year == 2026:
-                    row["vs 2027"] = li["annual_2027"] - annual
-                    row["vs 2028"] = li["annual_2028"] - annual
+            if selected_year == 2025:
+                # Pull line items from 2025 actuals
+                acct_line_items = [r for r in actuals_2025 if r["account"] == acct and not r["is_category"]]
+                for r in acct_line_items:
+                    row = {"Line Item": r["line_item"], "Annual": r["yearly_actual"]}
+                    for m in range(12):
+                        row[MONTH_LABELS[m]] = r["monthly_actual"][m]
+                    row["Budget"] = r["yearly_budget"]
+                    row["Variance"] = r["yearly_budget"] - r["yearly_actual"]
+                    rows.append(row)
+            else:
+                for li in info["line_items"]:
+                    annual = li_annual(li, selected_year)
+                    if annual == 0 and not li["name"]:
+                        continue
+                    row = {"Line Item": li["name"], "Annual": annual}
+                    if selected_year == 2026:
+                        for m in range(12):
+                            row[MONTH_LABELS[m]] = li["monthly_2026"][m]
+                    else:
+                        for m in range(12):
+                            row[MONTH_LABELS[m]] = annual / 12
+
+                    # YoY change
+                    prev_year = selected_year - 1
+                    if prev_year >= 2026:
+                        prev = li_annual(li, prev_year)
+                        change = annual - prev
+                        row["YoY Change"] = change
+                    elif selected_year == 2026:
+                        row["vs 2027"] = li_annual(li, 2027) - annual
+                        row["vs 2028"] = li_annual(li, 2028) - annual
 
                 rows.append(row)
 
