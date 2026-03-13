@@ -265,34 +265,47 @@ def load_drive_data(folder_id: str) -> dict:
         if parsed:
             acct = parsed["account"]
             if acct in gl_data:
-                existing = gl_data[acct]
-                existing["line_items"].extend(parsed["line_items"])
-                existing["years"] = sorted(set(existing["years"]) | set(parsed["years"]))
+                _merge_gl_data(gl_data[acct], parsed)
             else:
                 gl_data[acct] = parsed
 
     return gl_data
 
 
-def _process_files(file_data: dict[str, bytes]) -> dict:
-    """Parse all files and return gl_data dict keyed by account.
-    
-    Multiple files for the same account are merged (line items combined).
-    """
-    gl_data = {}
+def _merge_gl_data(existing: dict, new: dict):
+    """Merge line items from new into existing, combining by name."""
+    existing["years"] = sorted(set(existing["years"]) | set(new["years"]))
+    by_name = {}
+    for li in existing["line_items"]:
+        by_name[li["name"]] = li
+    for li in new["line_items"]:
+        if li["name"] in by_name:
+            for key, val in li.items():
+                if key == "name":
+                    continue
+                if key.startswith("annual_") or key.startswith("monthly_"):
+                    if isinstance(val, list):
+                        if sum(val) != 0:
+                            by_name[li["name"]][key] = val
+                    else:
+                        if val != 0:
+                            by_name[li["name"]][key] = val
+        else:
+            by_name[li["name"]] = li
+            existing["line_items"].append(li)
 
+
+def _process_files(file_data: dict[str, bytes]) -> dict:
+    """Parse all files and return gl_data dict keyed by account."""
+    gl_data = {}
     for fname, fbytes in sorted(file_data.items()):
         parsed = parse_gl_bytes(fbytes)
         if parsed:
             acct = parsed["account"]
             if acct in gl_data:
-                # Merge: combine line items and years
-                existing = gl_data[acct]
-                existing["line_items"].extend(parsed["line_items"])
-                existing["years"] = sorted(set(existing["years"]) | set(parsed["years"]))
+                _merge_gl_data(gl_data[acct], parsed)
             else:
                 gl_data[acct] = parsed
-
     return gl_data
 
 
