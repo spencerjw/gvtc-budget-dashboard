@@ -4,21 +4,19 @@ import plotly.express as px
 import plotly.graph_objects as go
 import csv
 import io
-import os
 import re
-import shutil
+import json
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="GVTC Dept 44 – Web Management Budget",
+    page_title="GVTC Dept 44 - Web Management Budget",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-MONTHS = [f"{m:02d}" for m in range(1, 13)]
 MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
@@ -47,66 +45,53 @@ PLOTLY_LAYOUT = dict(
 COLORS = px.colors.qualitative.Set3
 
 
-
-# ---------------------------------------------------------------------------
-# xlsx2csv helper – use Python API, fall back to CLI, then error
-# ---------------------------------------------------------------------------
-def _xlsx_bytes_to_rows(file_bytes: bytes) -> list[list[str]]:
-    """Convert xlsx bytes to a list of CSV rows using xlsx2csv."""
-    try:
-        from xlsx2csv import Xlsx2csv
-    except ImportError:
-        # Try CLI fallback
-        xlsx2csv_bin = shutil.which("xlsx2csv")
-        if xlsx2csv_bin is None:
-            st.error(
-                "**xlsx2csv** is not installed. Install it with: "
-                "`pip install xlsx2csv`"
-            )
-            return []
-        import subprocess
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
-        try:
-            result = subprocess.run(
-                [xlsx2csv_bin, tmp_path],
-                capture_output=True, text=True, timeout=30,
-            )
-            reader = csv.reader(io.StringIO(result.stdout))
-            return list(reader)
-        finally:
-            os.unlink(tmp_path)
-
-    # Use Python API
-    buf = io.BytesIO(file_bytes)
-    out = io.StringIO()
-    Xlsx2csv(buf).convert(out)
-    out.seek(0)
-    reader = csv.reader(out)
-    return list(reader)
-
-
-# ---------------------------------------------------------------------------
-# Data loading helpers
-# ---------------------------------------------------------------------------
 def _to_float(val: str) -> float:
+    """Convert a string like '1,167 ' or '(1,265)' to float."""
+    if not val or not isinstance(val, str):
+        return 0.0
+    s = val.strip().replace(",", "").replace(" ", "")
+    if not s:
+        return 0.0
+    # Handle parenthetical negatives: (1265) -> -1265
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1]
     try:
-        return float(val.replace(",", "").strip())
-    except (ValueError, AttributeError):
+        return float(s)
+    except ValueError:
         return 0.0
 
 
-def parse_gl_bytes(file_bytes: bytes) -> dict | None:
-    """Parse a single GL account xlsx export from bytes.
+# ---------------------------------------------------------------------------
+# Parsers
+# ---------------------------------------------------------------------------
 
-    Detects years dynamically from header row.
-    Returns dict with keys:
-        account   – e.g. '6623.18'
-        desc      – full GL description from Line000
-        years     – list of years found (e.g. [2025] or [2026, 2027, 2028])
-        line_items – list of dicts with name + per-year data
+def _xlsx_bytes_to_rows(file_bytes: bytes) -> list[list[str]]:
+    """Convert xlsx bytes to list of rows using xlsx2csv."""
+    try:
+        from xlsx2csv import Xlsx2csv
+    except ImportError:
+        return []
+
+    buf_in = io.BytesIO(file_bytes)
+    buf_out = io.StringIO()
+
+    try:
+        Xlsx2csv(buf_in, skip_empty_lines=False).convert(buf_out)
+    except Exception:
+        return []
+
+    buf_out.seek(0)
+    return list(csv.reader(buf_out))
+
+
+def parse_gl_budget(file_bytes: bytes) -> dict | None:
+    """Parse a GL account budget xlsx (from Jedox FinanceDetail cube).
+
+    Returns dict with:
+        account  - GL account number
+        name     - GL account description
+        years    - dict of year -> annual budget amount
+        monthly  - dict of year -> [12 monthly amounts] (if available)
     """
     rows = _xlsx_bytes_to_rows(file_bytes)
     if not rows:
@@ -131,36 +116,29 @@ def parse_gl_bytes(file_bytes: bytes) -> dict | None:
         return None
 
     # Detect year columns from header
-    # Format: ..., "Comments YYYY", "YYYY", "YYYY-01", ..., "YYYY-12", ...
-    year_columns = {}  # year -> {'annual_col': int, 'monthly_start': int}
+    year_columns = {}
     for ci, cell in enumerate(header_row):
         cell = cell.strip()
         m = re.match(r"^(\d{4})$", cell)
         if m:
             year = int(m.group(1))
-            # Check if next columns are monthly (YYYY-01, etc.)
             if ci + 1 < len(header_row) and re.match(rf"^{year}-\d{{2}}$", header_row[ci + 1].strip()):
                 year_columns[year] = {'annual_col': ci, 'monthly_start': ci + 1}
             else:
-                # Annual-only year (like 2027, 2028 in the original files)
                 year_columns[year] = {'annual_col': ci, 'monthly_start': None}
 
     if not year_columns:
         return None
 
-    # Primary year = first year with monthly data
-    primary_year = None
-    for y in sorted(year_columns.keys()):
-        if year_columns[y]['monthly_start'] is not None:
-            primary_year = y
-            break
-    if primary_year is None:
-        primary_year = min(year_columns.keys())
-
+    # Find Line000 description and sum all line items for totals
     desc = ""
-    line_items = []
+    years_totals = {y: 0.0 for y in year_columns}
+    monthly_totals = {}
+    for y, cols in year_columns.items():
+        if cols['monthly_start'] is not None:
+            monthly_totals[y] = [0.0] * 12
 
-    for r in rows[header_idx + 2:]:  # skip header + "Working Budget" row
+    for r in rows[header_idx + 2:]:
         if len(r) < 5:
             continue
         line_id = r[2].strip() if len(r) > 2 else ""
@@ -168,53 +146,149 @@ def parse_gl_bytes(file_bytes: bytes) -> dict | None:
             continue
 
         name = r[4].strip() if len(r) > 4 else ""
-
         if line_id == "Line000":
             desc = name
             continue
 
-        # Get primary year annual
-        pcol = year_columns[primary_year]['annual_col']
-        primary_annual = _to_float(r[pcol]) if len(r) > pcol else 0
-        if not name and primary_annual == 0:
-            continue
-        if not name:
-            continue
-
-        item = {"name": name}
-        for year, cols in sorted(year_columns.items()):
+        for year, cols in year_columns.items():
             acol = cols['annual_col']
-            item[f"annual_{year}"] = _to_float(r[acol]) if len(r) > acol else 0.0
+            val = _to_float(r[acol]) if len(r) > acol else 0.0
+            years_totals[year] += val
             if cols['monthly_start'] is not None:
-                item[f"monthly_{year}"] = [
-                    _to_float(r[cols['monthly_start'] + m]) if len(r) > cols['monthly_start'] + m else 0.0
-                    for m in range(12)
-                ]
-
-        line_items.append(item)
+                for m_i in range(12):
+                    idx = cols['monthly_start'] + m_i
+                    monthly_totals[year][m_i] += _to_float(r[idx]) if len(r) > idx else 0.0
 
     return {
         "account": account,
-        "desc": desc,
-        "years": sorted(year_columns.keys()),
-        "line_items": line_items,
+        "name": desc or GL_NAMES.get(account, account),
+        "years": years_totals,
+        "monthly": monthly_totals,
     }
 
 
-def category_label(account: str) -> str:
-    name = GL_NAMES.get(account, account)
-    return f"{account} – {name}"
+def parse_variance_report(file_bytes: bytes) -> dict | None:
+    """Parse a monthly Actual-to-Budget Expense Variance Report.
 
+    Returns dict with:
+        year       - e.g. 2026
+        month      - e.g. 1 (January)
+        month_label - e.g. "Jan"
+        accounts   - list of dicts with:
+            account, name, actual, budget, variance, variance_pct,
+            ytd_actual, ytd_budget, ytd_variance, ytd_variance_pct,
+            explanation, ytd_explanation
+        total      - dict with total actual, budget, variance for the month
+        ytd_total  - dict with total YTD actual, budget, variance
+    """
+    rows = _xlsx_bytes_to_rows(file_bytes)
+    if not rows:
+        return None
 
-def li_annual(li: dict, year: int) -> float:
-    """Get annual amount for a line item, safe for any year."""
-    key = f"annual_{year}"
-    return li.get(key, 0.0)
+    # Detect year and month from metadata rows
+    year = None
+    month_str = None
+    for r in rows[:12]:
+        if len(r) > 2 and r[0] == "Database":
+            # Row like: Database, localhost/GVTC, 2026-01
+            ym = r[2].strip()
+            match = re.match(r"(\d{4})-(\d{2})", ym)
+            if match:
+                year = int(match.group(1))
+                month_str = match.group(2)
+                break
+
+    if year is None or month_str is None:
+        return None
+
+    month_num = int(month_str)
+    month_label = MONTH_LABELS[month_num - 1] if 1 <= month_num <= 12 else month_str
+
+    # Find data rows (rows with GL account numbers like 6124.32)
+    accounts = []
+    total_row = None
+
+    for r in rows:
+        # GL account data rows have account in col 2 (6124.xx or 6623.xx)
+        if len(r) > 14:
+            acct_candidate = r[2].strip() if len(r) > 2 else ""
+            if re.match(r"\d{4}\.\d{2}", acct_candidate):
+                actual_month = _to_float(r[4])
+                budget_month = _to_float(r[5])
+                variance_month = _to_float(r[6])
+                variance_pct_str = r[7].strip().rstrip("%") if len(r) > 7 else "0"
+
+                # Account name from col 10
+                acct_name = r[10].strip() if len(r) > 10 else ""
+
+                # YTD columns (11=actual, 12=budget, 13=variance, 14=pct)
+                ytd_actual = _to_float(r[11]) if len(r) > 11 else 0.0
+                ytd_budget = _to_float(r[12]) if len(r) > 12 else 0.0
+                ytd_variance = _to_float(r[13]) if len(r) > 13 else 0.0
+                ytd_pct_str = r[14].strip().rstrip("%") if len(r) > 14 else "0"
+
+                # Explanations (col 8 for current month, col 16 for YTD)
+                explanation = r[8].strip() if len(r) > 8 else ""
+                ytd_explanation = r[16].strip() if len(r) > 16 else ""
+
+                accounts.append({
+                    "account": acct_candidate,
+                    "name": acct_name or GL_NAMES.get(acct_candidate, acct_candidate),
+                    "actual": actual_month,
+                    "budget": budget_month,
+                    "variance": variance_month,
+                    "variance_pct": variance_pct_str,
+                    "ytd_actual": ytd_actual,
+                    "ytd_budget": ytd_budget,
+                    "ytd_variance": ytd_variance,
+                    "ytd_variance_pct": ytd_pct_str,
+                    "explanation": explanation,
+                    "ytd_explanation": ytd_explanation,
+                })
+
+        # Total row
+        if len(r) > 4 and r[0] == "#_Department":
+            total_row = {
+                "actual": _to_float(r[3]),
+                "budget": _to_float(r[4]),
+                "variance": _to_float(r[5]),
+                "ytd_actual": _to_float(r[11]) if len(r) > 11 else 0.0,
+                "ytd_budget": _to_float(r[12]) if len(r) > 12 else 0.0,
+                "ytd_variance": _to_float(r[13]) if len(r) > 13 else 0.0,
+            }
+
+    if not accounts:
+        return None
+
+    # Calculate totals from accounts if total_row not found
+    if total_row is None:
+        total_row = {
+            "actual": sum(a["actual"] for a in accounts),
+            "budget": sum(a["budget"] for a in accounts),
+            "variance": sum(a["variance"] for a in accounts),
+            "ytd_actual": sum(a["ytd_actual"] for a in accounts),
+            "ytd_budget": sum(a["ytd_budget"] for a in accounts),
+            "ytd_variance": sum(a["ytd_variance"] for a in accounts),
+        }
+
+    return {
+        "year": year,
+        "month": month_num,
+        "month_label": month_label,
+        "accounts": accounts,
+        "total": total_row,
+        "ytd_total": {
+            "actual": total_row["ytd_actual"],
+            "budget": total_row["ytd_budget"],
+            "variance": total_row["ytd_variance"],
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
-# Google Drive data source
+# Google Drive integration
 # ---------------------------------------------------------------------------
+
 def _build_drive_service():
     """Build an authenticated Google Drive API service from st.secrets."""
     from google.oauth2.credentials import Credentials
@@ -232,10 +306,13 @@ def _build_drive_service():
 
 @st.cache_data(ttl=300, show_spinner="Loading budget data from Google Drive...")
 def load_drive_data(folder_id: str) -> dict:
-    """Load all budget files from Google Drive folder, parse, and return gl_data.
+    """Load all budget files from Google Drive folder.
 
-    Multiple files for the same GL account (e.g. 2025 actuals + 2026 budget) are merged.
-    Cached for 5 minutes. folder_id is passed as param so cache key is stable.
+    Returns dict with:
+        budgets     - dict of GL account -> budget data (annual + monthly)
+        variance    - list of parsed variance reports (one per month)
+        all_years   - sorted list of budget years found
+        all_accounts - sorted list of GL accounts found
     """
     service = _build_drive_service()
 
@@ -246,11 +323,13 @@ def load_drive_data(folder_id: str) -> dict:
     ).execute()
     files = results.get("files", [])
 
-    gl_data = {}
+    budgets = {}
+    variance_reports = []
     export_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
     for f in files:
         file_id = f["id"]
+        name = f["name"]
         mime = f["mimeType"]
 
         if mime == "application/vnd.google-apps.spreadsheet":
@@ -261,56 +340,52 @@ def load_drive_data(folder_id: str) -> dict:
             continue
 
         file_bytes = resp if isinstance(resp, bytes) else resp.encode("latin-1")
-        parsed = parse_gl_bytes(file_bytes)
+
+        # Try variance report first (they have "Variance" or "Actual+to+Budget" in name)
+        if "variance" in name.lower() or "actual" in name.lower() and "budget" in name.lower():
+            vr = parse_variance_report(file_bytes)
+            if vr:
+                variance_reports.append(vr)
+                continue
+
+        # Try GL budget file
+        parsed = parse_gl_budget(file_bytes)
         if parsed:
             acct = parsed["account"]
-            if acct in gl_data:
-                _merge_gl_data(gl_data[acct], parsed)
+            if acct in budgets:
+                # Merge years
+                for y, val in parsed["years"].items():
+                    if val != 0:
+                        budgets[acct]["years"][y] = val
+                for y, monthly in parsed["monthly"].items():
+                    if sum(monthly) != 0:
+                        budgets[acct]["monthly"][y] = monthly
             else:
-                gl_data[acct] = parsed
+                budgets[acct] = parsed
 
-    return gl_data
+    # Sort variance reports by year, month
+    variance_reports.sort(key=lambda v: (v["year"], v["month"]))
 
+    # Collect all years from budgets
+    all_years = set()
+    for acct, data in budgets.items():
+        all_years.update(data["years"].keys())
+    all_years = sorted(all_years)
 
-def _merge_gl_data(existing: dict, new: dict):
-    """Merge line items from new into existing, combining by name."""
-    existing["years"] = sorted(set(existing["years"]) | set(new["years"]))
-    by_name = {}
-    for li in existing["line_items"]:
-        by_name[li["name"]] = li
-    for li in new["line_items"]:
-        if li["name"] in by_name:
-            for key, val in li.items():
-                if key == "name":
-                    continue
-                if key.startswith("annual_") or key.startswith("monthly_"):
-                    if isinstance(val, list):
-                        if sum(val) != 0:
-                            by_name[li["name"]][key] = val
-                    else:
-                        if val != 0:
-                            by_name[li["name"]][key] = val
-        else:
-            by_name[li["name"]] = li
-            existing["line_items"].append(li)
+    # Collect all accounts
+    all_accounts = sorted(set(list(budgets.keys()) +
+        [a["account"] for vr in variance_reports for a in vr["accounts"]]))
 
-
-def _process_files(file_data: dict[str, bytes]) -> dict:
-    """Parse all files and return gl_data dict keyed by account."""
-    gl_data = {}
-    for fname, fbytes in sorted(file_data.items()):
-        parsed = parse_gl_bytes(fbytes)
-        if parsed:
-            acct = parsed["account"]
-            if acct in gl_data:
-                _merge_gl_data(gl_data[acct], parsed)
-            else:
-                gl_data[acct] = parsed
-    return gl_data
+    return {
+        "budgets": budgets,
+        "variance": variance_reports,
+        "all_years": all_years,
+        "all_accounts": all_accounts,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Sidebar: department info + navigation
+# Sidebar
 # ---------------------------------------------------------------------------
 with st.sidebar:
     st.markdown("### GVTC Department 44")
@@ -318,9 +393,7 @@ with st.sidebar:
     st.markdown("Entity: P0100")
     st.divider()
 
-# ---------------------------------------------------------------------------
-# Load data from Google Drive
-# ---------------------------------------------------------------------------
+# Load data
 try:
     _ = st.secrets["google_drive"]
     has_secrets = True
@@ -336,41 +409,31 @@ if not has_secrets:
     st.stop()
 
 try:
-    gl_data = load_drive_data(st.secrets["google_drive"]["folder_id"])
+    data = load_drive_data(st.secrets["google_drive"]["folder_id"])
 except Exception as e:
     st.error(f"**Failed to load data from Google Drive:** {e}")
     st.stop()
 
-if not gl_data:
-    st.warning(
-        "No valid GL account data found in the Google Drive folder. "
-        "Please check that the folder contains the correct GVTC budget files."
-    )
+budgets = data["budgets"]
+variance_reports = data["variance"]
+all_years = data["all_years"]
+all_accounts = data["all_accounts"]
+
+if not budgets and not variance_reports:
+    st.warning("No valid budget or variance data found in the Google Drive folder.")
     st.stop()
 
-# Collect all years across all GL files
-all_years = set()
-for acct, info in gl_data.items():
-    all_years.update(info.get("years", []))
-all_years = sorted(all_years)
+# Build actuals data: month -> account -> {actual, budget, variance}
+actuals_by_month = {}
+for vr in variance_reports:
+    key = (vr["year"], vr["month"])
+    actuals_by_month[key] = {}
+    for a in vr["accounts"]:
+        actuals_by_month[key][a["account"]] = a
 
-# Build summary DataFrames
-summary_rows = []
-for acct, info in sorted(gl_data.items()):
-    row = {
-        "account": acct,
-        "category": category_label(acct),
-        "short_name": GL_NAMES.get(acct, acct),
-    }
-    for year in all_years:
-        row[str(year)] = sum(li_annual(li, year) for li in info["line_items"])
-    summary_rows.append(row)
+# Latest variance report for YTD totals
+latest_vr = variance_reports[-1] if variance_reports else None
 
-df_summary = pd.DataFrame(summary_rows)
-
-# ---------------------------------------------------------------------------
-# Sidebar: navigation & filters (continued)
-# ---------------------------------------------------------------------------
 with st.sidebar:
     if st.button("🔄 Refresh Data"):
         load_drive_data.clear()
@@ -380,15 +443,14 @@ with st.sidebar:
 
     page = st.radio(
         "Navigate",
-        ["Budget Overview", "Monthly View", "Line Item Detail"],
+        ["Budget Overview", "Monthly Actuals", "Variance Analysis", "Year Comparison"],
         index=0,
     )
 
     st.divider()
-    selected_year = st.selectbox("Year", all_years, index=min(1, len(all_years) - 1))
 
-    # Build mapping: short name -> account number
-    _name_to_acct = {GL_NAMES.get(a, a): a for a in sorted(gl_data.keys())}
+    # Category filter
+    _name_to_acct = {GL_NAMES.get(a, a): a for a in sorted(all_accounts)}
     all_short_names = list(_name_to_acct.keys())
 
     if st.button("Select All Categories"):
@@ -401,19 +463,16 @@ with st.sidebar:
         key="cat_filter",
     )
 
-    # Prevent empty selection from crashing charts
     if not selected_names:
         selected_names = all_short_names
         st.session_state["cat_filter"] = all_short_names
         st.rerun()
 
-    st.divider()
-    total_budget = df_summary[str(selected_year)].sum()
-    st.metric("Total Budget", f"${total_budget:,.0f}", delta=None)
-
-# Filter helper
 filtered_accounts = [_name_to_acct[n] for n in selected_names if n in _name_to_acct]
-df_filtered = df_summary[df_summary["account"].isin(filtered_accounts)]
+
+
+def short_name(acct: str) -> str:
+    return GL_NAMES.get(acct, acct)
 
 
 # ---------------------------------------------------------------------------
@@ -422,319 +481,386 @@ df_filtered = df_summary[df_summary["account"].isin(filtered_accounts)]
 if page == "Budget Overview":
     st.title("Budget Overview")
 
-    if df_filtered.empty:
-        st.info("No data for the selected categories.")
+    # Top-level KPIs
+    if latest_vr:
+        ytd = latest_vr["ytd_total"]
+        through_month = latest_vr["month_label"]
+        yr = latest_vr["year"]
+
+        # Annual budget for the current year
+        annual_budget = sum(
+            budgets.get(a, {}).get("years", {}).get(yr, 0)
+            for a in filtered_accounts
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(f"{yr} Annual Budget", f"${annual_budget:,.0f}")
+        c2.metric(f"YTD Spent (thru {through_month})",
+                  f"${ytd['actual']:,.0f}")
+        c3.metric(f"YTD Budget",
+                  f"${ytd['budget']:,.0f}")
+
+        remaining = annual_budget - ytd['actual']
+        c4.metric("Remaining", f"${remaining:,.0f}",
+                  delta=f"${ytd['variance']:,.0f} {'under' if ytd['variance'] > 0 else 'over'} YTD")
+
+        st.divider()
+
+        # Progress bar
+        pct_used = ytd['actual'] / annual_budget * 100 if annual_budget else 0
+        month_pct = latest_vr["month"] / 12 * 100
+        st.markdown(f"**Budget Utilization:** {pct_used:.1f}% used ({month_pct:.0f}% through the year)")
+        st.progress(min(pct_used / 100, 1.0))
+
+        if pct_used > month_pct + 10:
+            st.warning(f"⚠️ Spending is ahead of pace. {pct_used:.1f}% used but only {month_pct:.0f}% through the year.")
+        elif pct_used < month_pct - 15:
+            st.info(f"💡 Spending is well under pace. {pct_used:.1f}% used, {month_pct:.0f}% through the year.")
+
+        st.divider()
+
+    # Budget by category (bar chart)
+    st.subheader("Annual Budget by Category")
+
+    if all_years:
+        selected_year = st.selectbox("Year", all_years, index=len(all_years) - 1,
+                                      key="overview_year")
+    else:
+        selected_year = None
+
+    if selected_year:
+        cat_data = []
+        for acct in filtered_accounts:
+            budget_val = budgets.get(acct, {}).get("years", {}).get(selected_year, 0)
+            row = {"Category": short_name(acct), "Budget": budget_val}
+
+            # Add YTD actual if we have variance data for this year
+            ytd_actual = 0
+            for vr in variance_reports:
+                if vr["year"] == selected_year:
+                    for a in vr["accounts"]:
+                        if a["account"] == acct:
+                            ytd_actual = a["ytd_actual"]
+            row["YTD Actual"] = ytd_actual
+            cat_data.append(row)
+
+        df_cat = pd.DataFrame(cat_data)
+
+        if not df_cat.empty:
+            fig = px.bar(
+                df_cat.melt(id_vars="Category", var_name="Type", value_name="Amount"),
+                x="Category", y="Amount", color="Type",
+                barmode="group",
+                color_discrete_map={"Budget": "#5B8DEF", "YTD Actual": "#2ED573"},
+                text_auto="$,.0f",
+            )
+            fig.update_layout(**PLOTLY_LAYOUT, height=450)
+            fig.update_traces(textposition="outside", textfont_size=10)
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Budget allocation donut
+    if selected_year:
+        st.subheader("Budget Allocation")
+        alloc_data = []
+        for acct in filtered_accounts:
+            val = budgets.get(acct, {}).get("years", {}).get(selected_year, 0)
+            if val > 0:
+                alloc_data.append({"Category": short_name(acct), "Budget": val})
+
+        if alloc_data:
+            df_alloc = pd.DataFrame(alloc_data)
+            fig_donut = px.pie(
+                df_alloc, values="Budget", names="Category",
+                color_discrete_sequence=COLORS,
+                hole=0.45,
+            )
+            fig_donut.update_layout(**PLOTLY_LAYOUT, height=400, showlegend=True)
+            fig_donut.update_traces(textinfo="percent", textposition="outside")
+            st.plotly_chart(fig_donut, use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# Page 2: Monthly Actuals
+# ---------------------------------------------------------------------------
+elif page == "Monthly Actuals":
+    st.title("Monthly Actuals vs Budget")
+
+    if not variance_reports:
+        st.info("No variance reports uploaded yet. Upload monthly Actual-to-Budget reports to see actuals data.")
         st.stop()
 
-    # Summary cards
-    year_strs = [str(y) for y in all_years]
-    cols = st.columns(len(year_strs))
-    for col, year_s in zip(cols, year_strs):
-        val = df_filtered[year_s].sum()
-        prev_s = str(int(year_s) - 1)
-        prev_val = df_filtered[prev_s].sum() if prev_s in df_filtered.columns else None
-        delta = f"${val - prev_val:+,.0f}" if prev_val is not None else None
-        col.metric(f"{year_s} Budget", f"${val:,.0f}", delta=delta)
-
-    st.divider()
-
-    col_left, col_right = st.columns(2)
-
-    # Horizontal bar chart – sorted by budget
-    with col_left:
-        st.subheader("Budget by GL Category")
-        df_bar = df_filtered[["short_name", str(selected_year)]].copy()
-        df_bar.columns = ["Category", "Budget"]
-        df_bar = df_bar.sort_values("Budget")
-        fig_bar = px.bar(
-            df_bar, x="Budget", y="Category", orientation="h",
-            color="Category", color_discrete_sequence=COLORS,
-            text_auto="$,.0f",
-        )
-        fig_bar.update_layout(**PLOTLY_LAYOUT, showlegend=False, height=450)
-        fig_bar.update_traces(textposition="outside")
-        st.plotly_chart(fig_bar, use_container_width=True)
-
-    # Category drill-down
-    with col_right:
-        st.subheader("Category Drill-Down")
-        # Build list of categories with budget > 0
-        drill_options = df_filtered[df_filtered[str(selected_year)] > 0][["account", "short_name", str(selected_year)]].copy()
-        drill_options.columns = ["account", "name", "budget"]
-        drill_options = drill_options.sort_values("budget", ascending=False)
-
-        drill_choices = ["All Categories"] + drill_options["name"].tolist()
-        drill_choice = st.selectbox(
-            "Select a category to see line items",
-            drill_choices,
-            index=0,
-        )
-
-        if drill_choice == "All Categories":
-            # Show overall distribution donut
-            df_pie = drill_options[["name", "budget"]].copy()
-            df_pie.columns = ["Category", "Budget"]
-            total = df_pie["Budget"].sum()
-            st.metric("Total Budget", f"${total:,.0f}")
-            fig_all = px.pie(
-                df_pie, values="Budget", names="Category",
-                color_discrete_sequence=COLORS,
-                hole=0.35,
-            )
-            fig_all.update_layout(**PLOTLY_LAYOUT, height=350,
-                                  legend=dict(font=dict(size=11)))
-            fig_all.update_traces(
-                textinfo="none",
-                textposition="inside",
-                textfont_size=11,
-                hovertemplate="%{label}<br>$%{value:,.0f}<br>%{percent}<extra></extra>",
-            )
-            st.plotly_chart(fig_all, use_container_width=True)
-        else:
-            # Drill into specific category
-            drill_acct = drill_options[drill_options["name"] == drill_choice]["account"].iloc[0]
-
-            if drill_acct in gl_data:
-                info = gl_data[drill_acct]
-                li_data = []
-                for li in info["line_items"]:
-                    annual = li_annual(li, selected_year)
-                    if annual > 0:
-                        li_data.append({"Line Item": li["name"], "Budget": annual})
-
-                if li_data:
-                    df_drill = pd.DataFrame(li_data).sort_values("Budget", ascending=False)
-                    total = df_drill["Budget"].sum()
-
-                    st.metric(f"{drill_choice} Total", f"${total:,.0f}")
-
-                    fig_drill = px.pie(
-                        df_drill, values="Budget", names="Line Item",
-                        color_discrete_sequence=COLORS,
-                        hole=0.35,
-                    )
-                    fig_drill.update_layout(**PLOTLY_LAYOUT, height=350,
-                                            legend=dict(font=dict(size=11)))
-                    fig_drill.update_traces(
-                        textinfo="none",
-                        texttemplate="%{label}<br>$%{value:,.0f}",
-                        textposition="inside" if len(li_data) > 4 else "outside",
-                        textfont_size=11,
-                    )
-                    st.plotly_chart(fig_drill, use_container_width=True)
-                else:
-                    st.info("No line items with budget for this year.")
-
-    # Year-over-year comparison
-    st.subheader("Year-over-Year Comparison")
-    yoy_cols = ["short_name"] + [str(y) for y in all_years]
-    df_yoy = df_filtered[yoy_cols].melt(
-        id_vars="short_name", var_name="Year", value_name="Budget"
-    )
-    yoy_colors = ["#2ED573", "#5B8DEF", "#F7B731", "#FC5C65"][:len(all_years)]
-    fig_yoy = px.bar(
-        df_yoy, x="short_name", y="Budget", color="Year",
-        barmode="group",
-        color_discrete_sequence=yoy_colors,
-        labels={"short_name": "Category", "Budget": "Budget ($)"},
-        text_auto="$,.0f",
-    )
-    fig_yoy.update_layout(**PLOTLY_LAYOUT, height=420)
-    fig_yoy.update_traces(textposition="outside", textfont_size=10)
-    st.plotly_chart(fig_yoy, use_container_width=True)
-
-
-# ---------------------------------------------------------------------------
-# Page 2: Monthly View
-# ---------------------------------------------------------------------------
-elif page == "Monthly View":
-    st.title(f"Monthly Budget Breakdown – {selected_year}")
-
-    # Build monthly data per category
+    # Monthly bars: actual vs budget per month
     monthly_data = []
-    for acct in filtered_accounts:
-        if acct not in gl_data:
-            continue
-        info = gl_data[acct]
-        monthly_totals = [0.0] * 12
-        monthly_key = f"monthly_{selected_year}"
-        for li in info["line_items"]:
-            if monthly_key in li:
-                for m in range(12):
-                    monthly_totals[m] += li[monthly_key][m]
-            else:
-                # Year only has annual total, spread evenly
-                annual = li_annual(li, selected_year)
-                for m in range(12):
-                    monthly_totals[m] += annual / 12
-        for m in range(12):
-            monthly_data.append({
-                "Month": MONTH_LABELS[m],
-                "Month_Num": m + 1,
-                "Category": GL_NAMES.get(acct, acct),
-                "Budget": monthly_totals[m],
-            })
+    for vr in variance_reports:
+        for a in vr["accounts"]:
+            if a["account"] in filtered_accounts:
+                monthly_data.append({
+                    "Month": vr["month_label"],
+                    "Month_Num": vr["month"],
+                    "Category": short_name(a["account"]),
+                    "Actual": a["actual"],
+                    "Budget": a["budget"],
+                })
 
     df_monthly = pd.DataFrame(monthly_data)
 
     if df_monthly.empty:
-        st.info("No data for the selected year and categories.")
+        st.info("No actuals data for the selected categories.")
         st.stop()
 
-    # Stacked area chart
-    st.subheader("Monthly Spending by Category")
-    fig_area = px.area(
-        df_monthly, x="Month", y="Budget", color="Category",
-        color_discrete_sequence=COLORS,
-        labels={"Budget": "Budget ($)"},
-        category_orders={"Month": MONTH_LABELS},
-    )
-    fig_area.update_layout(**PLOTLY_LAYOUT, height=450)
-    st.plotly_chart(fig_area, use_container_width=True)
+    # Aggregate by month
+    df_month_totals = df_monthly.groupby(["Month", "Month_Num"]).agg(
+        Actual=("Actual", "sum"),
+        Budget=("Budget", "sum"),
+    ).reset_index().sort_values("Month_Num")
+    df_month_totals["Variance"] = df_month_totals["Budget"] - df_month_totals["Actual"]
 
-    # Monthly totals bar chart highlighting concentrated months
-    st.subheader("Total Monthly Spending")
-    df_month_total = df_monthly.groupby(["Month", "Month_Num"])["Budget"].sum().reset_index()
-    df_month_total = df_month_total.sort_values("Month_Num")
-    avg_spend = df_month_total["Budget"].mean()
-    df_month_total["Highlight"] = df_month_total["Budget"].apply(
-        lambda x: "Above Average" if x > avg_spend * 1.2 else "Normal"
-    )
-    fig_totals = px.bar(
-        df_month_total, x="Month", y="Budget", color="Highlight",
-        color_discrete_map={"Above Average": "#FC5C65", "Normal": "#5B8DEF"},
-        text_auto="$,.0f",
-        category_orders={"Month": MONTH_LABELS},
-    )
-    fig_totals.update_layout(**PLOTLY_LAYOUT, height=350, showlegend=True)
-    fig_totals.update_traces(textposition="outside")
-    st.plotly_chart(fig_totals, use_container_width=True)
+    st.subheader("Total Spend by Month")
+    fig_monthly = go.Figure()
+    fig_monthly.add_trace(go.Bar(
+        x=df_month_totals["Month"], y=df_month_totals["Actual"],
+        name="Actual", marker_color="#2ED573",
+        text=[f"${v:,.0f}" for v in df_month_totals["Actual"]],
+        textposition="outside",
+    ))
+    fig_monthly.add_trace(go.Bar(
+        x=df_month_totals["Month"], y=df_month_totals["Budget"],
+        name="Budget", marker_color="#5B8DEF",
+        text=[f"${v:,.0f}" for v in df_month_totals["Budget"]],
+        textposition="outside",
+    ))
+    fig_monthly.update_layout(**PLOTLY_LAYOUT, barmode="group", height=400)
+    st.plotly_chart(fig_monthly, use_container_width=True)
 
-    # Monthly breakdown table
-    st.subheader("Monthly Breakdown Table")
-    pivot_data = df_monthly.pivot_table(
-        index="Category", columns="Month", values="Budget", aggfunc="sum"
-    )
-    pivot_data = pivot_data[MONTH_LABELS]
-    pivot_data["Annual"] = pivot_data.sum(axis=1)
-    pivot_data.loc["TOTAL"] = pivot_data.sum()
-    st.dataframe(
-        pivot_data.style.format("${:,.0f}"),
-        use_container_width=True,
-        height=450,
-    )
+    st.divider()
 
-
-# ---------------------------------------------------------------------------
-# Page 3: Line Item Detail
-# ---------------------------------------------------------------------------
-elif page == "Line Item Detail":
-    st.title(f"Line Item Detail – {selected_year}")
-
-    for acct in sorted(filtered_accounts):
-        if acct not in gl_data:
+    # Per-category monthly breakdown
+    st.subheader("By Category")
+    for acct in filtered_accounts:
+        name = short_name(acct)
+        acct_data = df_monthly[df_monthly["Category"] == name]
+        if acct_data.empty:
             continue
-        info = gl_data[acct]
-        label = category_label(acct)
-        total = sum(li_annual(li, selected_year) for li in info["line_items"])
 
-        with st.expander(f"{label}  —  ${total:,.0f}", expanded=False):
-            rows = []
-            monthly_key = f"monthly_{selected_year}"
+        with st.expander(f"{name} ({acct})"):
+            fig_cat = go.Figure()
+            fig_cat.add_trace(go.Bar(
+                x=acct_data["Month"], y=acct_data["Actual"],
+                name="Actual", marker_color="#2ED573",
+            ))
+            fig_cat.add_trace(go.Bar(
+                x=acct_data["Month"], y=acct_data["Budget"],
+                name="Budget", marker_color="#5B8DEF",
+            ))
+            fig_cat.update_layout(**PLOTLY_LAYOUT, barmode="group", height=300,
+                                   title=name)
+            st.plotly_chart(fig_cat, use_container_width=True)
 
-            for li in info["line_items"]:
-                annual = li_annual(li, selected_year)
-                if annual == 0 and not li["name"]:
-                    continue
-                row = {"Line Item": li["name"], "Annual": annual}
-                if monthly_key in li:
-                    for m in range(12):
-                        row[MONTH_LABELS[m]] = li[monthly_key][m]
-                else:
-                    for m in range(12):
-                        row[MONTH_LABELS[m]] = annual / 12
 
-                # YoY change vs previous year if available
-                prev_year = selected_year - 1
-                if str(prev_year) in df_summary.columns:
-                    prev = li_annual(li, prev_year)
-                    row["YoY Change"] = annual - prev
+# ---------------------------------------------------------------------------
+# Page 3: Variance Analysis
+# ---------------------------------------------------------------------------
+elif page == "Variance Analysis":
+    st.title("Variance Analysis")
 
-                rows.append(row)
+    if not variance_reports:
+        st.info("No variance reports uploaded yet.")
+        st.stop()
 
-            if not rows:
-                st.info("No line items with budget.")
-                continue
+    # Month selector
+    vr_options = {f"{vr['month_label']} {vr['year']}": vr for vr in variance_reports}
+    selected_vr_label = st.selectbox("Report Period", list(vr_options.keys()),
+                                      index=len(vr_options) - 1)
+    vr = vr_options[selected_vr_label]
 
-            df_detail = pd.DataFrame(rows)
+    # Summary cards
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"{vr['month_label']} Actual", f"${vr['total']['actual']:,.0f}")
+    c2.metric(f"{vr['month_label']} Budget", f"${vr['total']['budget']:,.0f}")
+    variance_val = vr['total']['variance']
+    c3.metric("Variance",
+              f"${abs(variance_val):,.0f} {'under' if variance_val > 0 else 'over'}",
+              delta=f"${variance_val:+,.0f}",
+              delta_color="normal")
 
-            # Highlight changes
-            def color_change(val):
-                if not isinstance(val, (int, float)):
-                    return ""
+    st.divider()
+
+    # YTD summary
+    if vr.get("ytd_total"):
+        st.subheader(f"Year-to-Date (thru {vr['month_label']})")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("YTD Actual", f"${vr['ytd_total']['actual']:,.0f}")
+        c2.metric("YTD Budget", f"${vr['ytd_total']['budget']:,.0f}")
+        ytd_var = vr['ytd_total']['variance']
+        c3.metric("YTD Variance",
+                  f"${abs(ytd_var):,.0f} {'under' if ytd_var > 0 else 'over'}",
+                  delta=f"${ytd_var:+,.0f}",
+                  delta_color="normal")
+
+    st.divider()
+
+    # Variance by category
+    st.subheader("Variance by Category")
+    var_data = []
+    for a in vr["accounts"]:
+        if a["account"] in filtered_accounts:
+            var_data.append({
+                "Category": short_name(a["account"]),
+                "Account": a["account"],
+                "Actual": a["actual"],
+                "Budget": a["budget"],
+                "Variance ($)": a["variance"],
+                "Variance (%)": a["variance_pct"],
+                "Explanation": a["explanation"],
+            })
+
+    df_var = pd.DataFrame(var_data)
+
+    if not df_var.empty:
+        # Horizontal bar chart
+        fig_var = px.bar(
+            df_var, x="Variance ($)", y="Category", orientation="h",
+            color=df_var["Variance ($)"].apply(lambda v: "Under Budget" if v > 0 else "Over Budget"),
+            color_discrete_map={"Under Budget": "#2ED573", "Over Budget": "#FC5C65"},
+            text_auto="$,.0f",
+        )
+        fig_var.update_layout(**PLOTLY_LAYOUT, height=max(300, len(df_var) * 45),
+                               showlegend=True)
+        fig_var.update_traces(textposition="outside", textfont_size=11)
+        st.plotly_chart(fig_var, use_container_width=True)
+
+        st.divider()
+
+        # Detail table with explanations
+        st.subheader("Detail")
+        display_cols = ["Category", "Actual", "Budget", "Variance ($)", "Variance (%)"]
+        has_explanations = any(a["explanation"] for a in vr["accounts"])
+        if has_explanations:
+            display_cols.append("Explanation")
+
+        def color_variance(val):
+            if isinstance(val, (int, float)):
                 if val > 0:
                     return "color: #2ED573"
                 elif val < 0:
                     return "color: #FC5C65"
-                return ""
+            return ""
 
-            change_cols = [c for c in df_detail.columns if "Change" in c or "vs " in c]
-            format_dict = {c: "${:,.0f}" for c in df_detail.columns if c != "Line Item"}
-            styled = df_detail.style.format(format_dict)
-            if change_cols:
-                styled = styled.map(color_change, subset=change_cols)
+        fmt = {"Actual": "${:,.0f}", "Budget": "${:,.0f}", "Variance ($)": "${:+,.0f}"}
+        styled = df_var[display_cols].style.format(fmt).map(
+            color_variance, subset=["Variance ($)"]
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
-            st.dataframe(styled, use_container_width=True, hide_index=True)
-
-            # Mini bar chart for this category
-            fig_items = px.bar(
-                df_detail, x="Line Item", y="Annual",
-                color_discrete_sequence=COLORS,
-                text_auto="$,.0f",
-            )
-            fig_items.update_layout(**PLOTLY_LAYOUT, height=300, showlegend=False)
-            fig_items.update_traces(textposition="outside")
-            st.plotly_chart(fig_items, use_container_width=True)
-
-    # Year comparison summary
+    # YTD variance table
     st.divider()
+    st.subheader(f"Year-to-Date Detail (thru {vr['month_label']})")
+    ytd_data = []
+    for a in vr["accounts"]:
+        if a["account"] in filtered_accounts:
+            ytd_data.append({
+                "Category": short_name(a["account"]),
+                "YTD Actual": a["ytd_actual"],
+                "YTD Budget": a["ytd_budget"],
+                "YTD Variance ($)": a["ytd_variance"],
+                "YTD Variance (%)": a["ytd_variance_pct"],
+            })
+
+    df_ytd = pd.DataFrame(ytd_data)
+    if not df_ytd.empty:
+        fmt_ytd = {
+            "YTD Actual": "${:,.0f}",
+            "YTD Budget": "${:,.0f}",
+            "YTD Variance ($)": "${:+,.0f}",
+        }
+        styled_ytd = df_ytd.style.format(fmt_ytd).map(
+            color_variance, subset=["YTD Variance ($)"]
+        )
+        st.dataframe(styled_ytd, use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# Page 4: Year Comparison
+# ---------------------------------------------------------------------------
+elif page == "Year Comparison":
+    st.title("Year-over-Year Budget Comparison")
+
+    if not all_years:
+        st.info("No budget data loaded.")
+        st.stop()
+
+    # Summary cards per year
+    year_strs = [str(y) for y in all_years]
+    cols = st.columns(len(year_strs))
+    for col, year in zip(cols, all_years):
+        total = sum(budgets.get(a, {}).get("years", {}).get(year, 0) for a in filtered_accounts)
+        col.metric(f"{year} Budget", f"${total:,.0f}")
+
+    st.divider()
+
+    # YoY grouped bar chart
+    yoy_data = []
+    for acct in filtered_accounts:
+        for year in all_years:
+            val = budgets.get(acct, {}).get("years", {}).get(year, 0)
+            yoy_data.append({
+                "Category": short_name(acct),
+                "Year": str(year),
+                "Budget": val,
+            })
+
+    df_yoy = pd.DataFrame(yoy_data)
+
+    if not df_yoy.empty:
+        yoy_colors = ["#2ED573", "#5B8DEF", "#F7B731", "#FC5C65"][:len(all_years)]
+        fig_yoy = px.bar(
+            df_yoy, x="Category", y="Budget", color="Year",
+            barmode="group",
+            color_discrete_sequence=yoy_colors,
+            text_auto="$,.0f",
+        )
+        fig_yoy.update_layout(**PLOTLY_LAYOUT, height=450)
+        fig_yoy.update_traces(textposition="outside", textfont_size=10)
+        st.plotly_chart(fig_yoy, use_container_width=True)
+
+    st.divider()
+
+    # YoY table with change columns
     st.subheader("Year-over-Year Summary")
     yoy_rows = []
-    for acct in sorted(filtered_accounts):
-        if acct not in gl_data:
-            continue
-        info = gl_data[acct]
-        info = gl_data[acct]
-        row_data = {"Category": GL_NAMES.get(acct, acct)}
+    for acct in filtered_accounts:
+        row = {"Category": short_name(acct)}
         year_totals = {}
         for y in all_years:
-            t = sum(li_annual(li, y) for li in info["line_items"])
-            row_data[str(y)] = t
+            t = budgets.get(acct, {}).get("years", {}).get(y, 0)
+            row[str(y)] = t
             year_totals[y] = t
         for i in range(1, len(all_years)):
             prev_y = all_years[i - 1]
             curr_y = all_years[i]
             short_prev = str(prev_y)[-2:]
             short_curr = str(curr_y)[-2:]
-            row_data[f"{short_prev}→{short_curr}"] = year_totals[curr_y] - year_totals[prev_y]
-        yoy_rows.append(row_data)
-    df_yoy = pd.DataFrame(yoy_rows)
-    totals = df_yoy.select_dtypes(include="number").sum()
-    totals["Category"] = "TOTAL"
-    df_yoy = pd.concat([df_yoy, pd.DataFrame([totals])], ignore_index=True)
+            row[f"{short_prev}→{short_curr}"] = year_totals[curr_y] - year_totals[prev_y]
+        yoy_rows.append(row)
 
-    def color_change(val):
-        if not isinstance(val, (int, float)):
+    df_yoy_table = pd.DataFrame(yoy_rows)
+
+    if not df_yoy_table.empty:
+        change_cols = [c for c in df_yoy_table.columns if "→" in c]
+
+        def color_change(val):
+            if isinstance(val, (int, float)):
+                if val > 0:
+                    return "color: #FC5C65"  # increase = red (more spending)
+                elif val < 0:
+                    return "color: #2ED573"  # decrease = green (less spending)
             return ""
-        if val > 0:
-            return "color: #2ED573"
-        elif val < 0:
-            return "color: #FC5C65"
-        return ""
 
-    fmt = {c: "${:,.0f}" for c in df_yoy.columns if c != "Category"}
-    change_cols = [c for c in df_yoy.columns if "→" in c]
-    styled = df_yoy.style.format(fmt).map(color_change, subset=change_cols)
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+        fmt_cols = {c: "${:,.0f}" for c in df_yoy_table.columns if c != "Category"}
+        for c in change_cols:
+            fmt_cols[c] = "${:+,.0f}"
 
-
+        styled = df_yoy_table.style.format(fmt_cols).map(
+            color_change, subset=change_cols
+        )
+        st.dataframe(styled, use_container_width=True, hide_index=True)
