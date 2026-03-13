@@ -230,14 +230,13 @@ def _build_drive_service():
     return build("drive", "v3", credentials=creds)
 
 
-@st.cache_data(ttl=300)
-def load_drive_data() -> dict:
+@st.cache_data(ttl=300, show_spinner="Loading budget data from Google Drive...")
+def load_drive_data(folder_id: str) -> dict:
     """Load all budget files from Google Drive folder, parse, and return gl_data.
 
     Multiple files for the same GL account (e.g. 2025 actuals + 2026 budget) are merged.
-    Cached for 5 minutes.
+    Cached for 5 minutes. folder_id is passed as param so cache key is stable.
     """
-    folder_id = st.secrets["google_drive"]["folder_id"]
     service = _build_drive_service()
 
     results = service.files().list(
@@ -324,7 +323,7 @@ if not has_secrets:
     st.stop()
 
 try:
-    gl_data = load_drive_data()
+    gl_data = load_drive_data(st.secrets["google_drive"]["folder_id"])
 except Exception as e:
     st.error(f"**Failed to load data from Google Drive:** {e}")
     st.stop()
