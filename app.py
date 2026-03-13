@@ -377,11 +377,22 @@ with st.sidebar:
     # Build mapping: short name -> account number
     _name_to_acct = {GL_NAMES.get(a, a): a for a in sorted(gl_data.keys())}
     all_short_names = list(_name_to_acct.keys())
+
+    if st.button("Select All Categories"):
+        st.session_state["cat_filter"] = all_short_names
+
     selected_names = st.multiselect(
         "Filter Categories",
         all_short_names,
-        default=all_short_names,
+        default=st.session_state.get("cat_filter", all_short_names),
+        key="cat_filter",
     )
+
+    # Prevent empty selection from crashing charts
+    if not selected_names:
+        selected_names = all_short_names
+        st.session_state["cat_filter"] = all_short_names
+        st.rerun()
 
     st.divider()
     total_budget = df_summary[str(selected_year)].sum()
