@@ -84,87 +84,106 @@ def _xlsx_bytes_to_rows(file_bytes: bytes) -> list[list[str]]:
     return list(csv.reader(buf_out))
 
 
-def parse_gl_budget(file_bytes: bytes) -> dict | None:
-    """Parse a GL account budget xlsx (from Jedox FinanceDetail cube).
+def parse_forecast_file(file_bytes: bytes) -> dict:
+    """Parse the Web Management Yearly Budget Forecast file.
 
-    Returns dict with:
-        account  - GL account number
-        name     - GL account description
-        years    - dict of year -> annual budget amount
-        monthly  - dict of year -> [12 monthly amounts] (if available)
+    This single file contains all GL accounts with:
+    - 2025 Total (actual/forecast)
+    - 2026/2027/2028 annual budgets + monthly breakdowns
+    - Comments per year
+
+    Returns dict keyed by GL account number, each with:
+        name, years (year -> annual), monthly (year -> [12 months]), comments (year -> str)
     """
     rows = _xlsx_bytes_to_rows(file_bytes)
     if not rows:
-        return None
+        return {}
 
-    account = None
-    for r in rows:
-        if len(r) > 1 and r[0] == "" and r[1] == "Account":
-            account = r[2].strip() if len(r) > 2 else None
-            break
+    # Header row 0 has column labels
+    header = rows[0] if rows else []
 
-    # Find the header row (contains "Line Item")
-    header_idx = None
-    header_row = []
-    for i, r in enumerate(rows):
-        if any("Line Item" in c for c in r):
-            header_idx = i
-            header_row = r
-            break
+    # Detect year columns from header: find "YYYY Total" and "YYYY" + "YYYY-01"..."YYYY-12"
+    year_columns = {}  # year -> {total_col, annual_col, monthly_start, comments_col}
 
-    if header_idx is None or account is None:
-        return None
-
-    # Detect year columns from header
-    year_columns = {}
-    for ci, cell in enumerate(header_row):
+    for ci, cell in enumerate(header):
         cell = cell.strip()
+
+        # "2025 Total" -> 2025 total column (no monthly)
+        m = re.match(r"^(\d{4}) Total$", cell)
+        if m:
+            year = int(m.group(1))
+            if year not in year_columns:
+                year_columns[year] = {"total_col": ci}
+            else:
+                year_columns[year]["total_col"] = ci
+            continue
+
+        # "2026" standalone (annual budget column, before monthly)
         m = re.match(r"^(\d{4})$", cell)
         if m:
             year = int(m.group(1))
-            if ci + 1 < len(header_row) and re.match(rf"^{year}-\d{{2}}$", header_row[ci + 1].strip()):
-                year_columns[year] = {'annual_col': ci, 'monthly_start': ci + 1}
-            else:
-                year_columns[year] = {'annual_col': ci, 'monthly_start': None}
+            # Check if next col is YYYY-01
+            if ci + 1 < len(header) and re.match(rf"^{year}-01$", header[ci + 1].strip()):
+                if year not in year_columns:
+                    year_columns[year] = {}
+                year_columns[year]["annual_col"] = ci
+                year_columns[year]["monthly_start"] = ci + 1
 
-    if not year_columns:
-        return None
+        # "Comments YYYY"
+        m = re.match(r"^Comments (\d{4})$", cell)
+        if m:
+            year = int(m.group(1))
+            if year not in year_columns:
+                year_columns[year] = {}
+            year_columns[year]["comments_col"] = ci
 
-    # Find Line000 description and sum all line items for totals
-    desc = ""
-    years_totals = {y: 0.0 for y in year_columns}
-    monthly_totals = {}
-    for y, cols in year_columns.items():
-        if cols['monthly_start'] is not None:
-            monthly_totals[y] = [0.0] * 12
+    budgets = {}
 
-    for r in rows[header_idx + 2:]:
-        if len(r) < 5:
-            continue
-        line_id = r[2].strip() if len(r) > 2 else ""
-        if not re.match(r"Line\d+", line_id):
+    for r in rows[2:]:  # Skip header rows
+        if len(r) < 11:
             continue
 
-        name = r[4].strip() if len(r) > 4 else ""
-        if line_id == "Line000":
-            desc = name
+        # Account info in col 4: "6124.32 - General Purpose Computers - ..."
+        acct_cell = r[4].strip() if len(r) > 4 else ""
+        m = re.match(r"^(\d{4}\.\d{2})\s*-\s*(.+)$", acct_cell)
+        if not m:
             continue
+
+        account = m.group(1)
+        full_name = m.group(2).strip()
+
+        entry = {
+            "name": GL_NAMES.get(account, full_name),
+            "full_name": full_name,
+            "years": {},
+            "monthly": {},
+            "comments": {},
+        }
 
         for year, cols in year_columns.items():
-            acol = cols['annual_col']
-            val = _to_float(r[acol]) if len(r) > acol else 0.0
-            years_totals[year] += val
-            if cols['monthly_start'] is not None:
-                for m_i in range(12):
-                    idx = cols['monthly_start'] + m_i
-                    monthly_totals[year][m_i] += _to_float(r[idx]) if len(r) > idx else 0.0
+            # Annual total
+            if "total_col" in cols:
+                entry["years"][year] = _to_float(r[cols["total_col"]]) if len(r) > cols["total_col"] else 0.0
+            elif "annual_col" in cols:
+                entry["years"][year] = _to_float(r[cols["annual_col"]]) if len(r) > cols["annual_col"] else 0.0
 
-    return {
-        "account": account,
-        "name": desc or GL_NAMES.get(account, account),
-        "years": years_totals,
-        "monthly": monthly_totals,
-    }
+            # Monthly breakdown
+            if "monthly_start" in cols:
+                monthly = []
+                for m_i in range(12):
+                    idx = cols["monthly_start"] + m_i
+                    monthly.append(_to_float(r[idx]) if len(r) > idx else 0.0)
+                entry["monthly"][year] = monthly
+
+            # Comments
+            if "comments_col" in cols:
+                comment = r[cols["comments_col"]].strip() if len(r) > cols["comments_col"] else ""
+                if comment:
+                    entry["comments"][year] = comment
+
+        budgets[account] = entry
+
+    return budgets
 
 
 def parse_variance_report(file_bytes: bytes) -> dict | None:
@@ -340,28 +359,29 @@ def load_drive_data(folder_id: str) -> dict:
             continue
 
         file_bytes = resp if isinstance(resp, bytes) else resp.encode("latin-1")
+        name_lower = name.lower()
 
-        # Try variance report first (they have "Variance" or "Actual+to+Budget" in name)
-        if "variance" in name.lower() or "actual" in name.lower() and "budget" in name.lower():
+        # Variance reports: contain "variance" or "actual" + "budget" in name
+        if "variance" in name_lower or ("actual" in name_lower and "budget" in name_lower):
             vr = parse_variance_report(file_bytes)
             if vr:
                 variance_reports.append(vr)
                 continue
 
-        # Try GL budget file
-        parsed = parse_gl_budget(file_bytes)
-        if parsed:
-            acct = parsed["account"]
-            if acct in budgets:
-                # Merge years
-                for y, val in parsed["years"].items():
-                    if val != 0:
-                        budgets[acct]["years"][y] = val
-                for y, monthly in parsed["monthly"].items():
-                    if sum(monthly) != 0:
-                        budgets[acct]["monthly"][y] = monthly
-            else:
-                budgets[acct] = parsed
+        # Budget forecast file: contains all GL accounts
+        if "budget" in name_lower or "forecast" in name_lower:
+            parsed = parse_forecast_file(file_bytes)
+            if parsed:
+                for acct, data in parsed.items():
+                    if acct in budgets:
+                        for y, val in data["years"].items():
+                            if val != 0:
+                                budgets[acct]["years"][y] = val
+                        for y, monthly in data["monthly"].items():
+                            if sum(monthly) != 0:
+                                budgets[acct]["monthly"][y] = monthly
+                    else:
+                        budgets[acct] = data
 
     # Sort variance reports by year, month
     variance_reports.sort(key=lambda v: (v["year"], v["month"]))
