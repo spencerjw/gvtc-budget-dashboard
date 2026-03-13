@@ -409,6 +409,10 @@ df_filtered = df_summary[df_summary["account"].isin(filtered_accounts)]
 if page == "Budget Overview":
     st.title("Budget Overview")
 
+    if df_filtered.empty:
+        st.info("No data for the selected categories.")
+        st.stop()
+
     # Summary cards
     year_strs = [str(y) for y in all_years]
     cols = st.columns(len(year_strs))
@@ -559,6 +563,10 @@ elif page == "Monthly View":
             })
 
     df_monthly = pd.DataFrame(monthly_data)
+
+    if df_monthly.empty:
+        st.info("No data for the selected year and categories.")
+        st.stop()
 
     # Stacked area chart
     st.subheader("Monthly Spending by Category")
