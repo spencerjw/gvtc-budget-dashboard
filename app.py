@@ -399,16 +399,29 @@ if not gl_data:
     )
     st.stop()
 
+# Build 2025 actuals lookup by account
+actuals_by_account = {}
+for r in actuals_2025:
+    if r["is_category"]:
+        actuals_by_account[r["account"]] = {
+            "budget": r["yearly_budget"],
+            "actual": r["yearly_actual"],
+            "monthly_budget": r["monthly_budget"],
+            "monthly_actual": r["monthly_actual"],
+        }
+
 # Build summary DataFrames
 summary_rows = []
 for acct, info in sorted(gl_data.items()):
     total_2026 = sum(li["annual_2026"] for li in info["line_items"])
     total_2027 = sum(li["annual_2027"] for li in info["line_items"])
     total_2028 = sum(li["annual_2028"] for li in info["line_items"])
+    actual_2025 = actuals_by_account.get(acct, {}).get("actual", 0)
     summary_rows.append({
         "account": acct,
         "category": category_label(acct),
         "short_name": GL_NAMES.get(acct, acct),
+        "2025": actual_2025,
         "2026": total_2026,
         "2027": total_2027,
         "2028": total_2028,
@@ -428,12 +441,12 @@ with st.sidebar:
 
     page = st.radio(
         "Navigate",
-        ["Budget Overview", "Monthly View", "Line Item Detail", "2025 Actuals"],
+        ["Budget Overview", "Monthly View", "Line Item Detail", "2025 Budget vs Actual"],
         index=0,
     )
 
     st.divider()
-    selected_year = st.selectbox("Year", [2026, 2027, 2028], index=0)
+    selected_year = st.selectbox("Year", [2025, 2026, 2027, 2028], index=1)
 
     # Build mapping: short name -> account number
     _name_to_acct = {GL_NAMES.get(a, a): a for a in sorted(gl_data.keys())}
@@ -460,12 +473,13 @@ if page == "Budget Overview":
     st.title("Budget Overview")
 
     # Summary cards
-    c1, c2, c3 = st.columns(3)
-    for col, year in zip([c1, c2, c3], ["2026", "2027", "2028"]):
+    cols = st.columns(4)
+    for col, year in zip(cols, ["2025", "2026", "2027", "2028"]):
         val = df_filtered[year].sum()
-        prev_val = df_filtered[str(int(year) - 1)].sum() if year != "2026" else None
+        prev_val = df_filtered[str(int(year) - 1)].sum() if int(year) > 2025 else None
         delta = f"${val - prev_val:+,.0f}" if prev_val is not None else None
-        col.metric(f"{year} Total Budget", f"${val:,.0f}", delta=delta)
+        label = f"{year} Actual" if year == "2025" else f"{year} Budget"
+        col.metric(label, f"${val:,.0f}", delta=delta)
 
     st.divider()
 
@@ -558,13 +572,13 @@ if page == "Budget Overview":
 
     # Year-over-year comparison
     st.subheader("Year-over-Year Comparison")
-    df_yoy = df_filtered[["short_name", "2026", "2027", "2028"]].melt(
+    df_yoy = df_filtered[["short_name", "2025", "2026", "2027", "2028"]].melt(
         id_vars="short_name", var_name="Year", value_name="Budget"
     )
     fig_yoy = px.bar(
         df_yoy, x="short_name", y="Budget", color="Year",
         barmode="group",
-        color_discrete_sequence=["#5B8DEF", "#F7B731", "#FC5C65"],
+        color_discrete_sequence=["#2ED573", "#5B8DEF", "#F7B731", "#FC5C65"],
         labels={"short_name": "Category", "Budget": "Budget ($)"},
         text_auto="$,.0f",
     )
@@ -730,14 +744,17 @@ elif page == "Line Item Detail":
         if acct not in gl_data:
             continue
         info = gl_data[acct]
+        t25 = actuals_by_account.get(acct, {}).get("actual", 0)
         t26 = sum(li["annual_2026"] for li in info["line_items"])
         t27 = sum(li["annual_2027"] for li in info["line_items"])
         t28 = sum(li["annual_2028"] for li in info["line_items"])
         yoy_rows.append({
             "Category": GL_NAMES.get(acct, acct),
+            "2025": t25,
             "2026": t26,
             "2027": t27,
             "2028": t28,
+            "25→26": t26 - t25,
             "26→27": t27 - t26,
             "27→28": t28 - t27,
         })
@@ -756,14 +773,15 @@ elif page == "Line Item Detail":
         return ""
 
     fmt = {c: "${:,.0f}" for c in df_yoy.columns if c != "Category"}
-    styled = df_yoy.style.format(fmt).map(color_change, subset=["26→27", "27→28"])
+    change_cols = [c for c in df_yoy.columns if "→" in c]
+    styled = df_yoy.style.format(fmt).map(color_change, subset=change_cols)
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
 # ---------------------------------------------------------------------------
 # Page 4: 2025 Actuals
 # ---------------------------------------------------------------------------
-elif page == "2025 Actuals":
+elif page == "2025 Budget vs Actual":
     st.title("2025 Budget vs Actuals")
 
     if not actuals_2025:
