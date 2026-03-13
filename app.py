@@ -46,7 +46,6 @@ PLOTLY_LAYOUT = dict(
 
 COLORS = px.colors.qualitative.Set3
 
-MASTER_FILE_NAME = "Dept 44 Budget"
 
 
 # ---------------------------------------------------------------------------
@@ -102,10 +101,12 @@ def _to_float(val: str) -> float:
 def parse_gl_bytes(file_bytes: bytes) -> dict | None:
     """Parse a single GL account xlsx export from bytes.
 
+    Detects years dynamically from header row.
     Returns dict with keys:
         account   – e.g. '6623.18'
         desc      – full GL description from Line000
-        line_items – list of dicts with name, annual, monthly, per year
+        years     – list of years found (e.g. [2025] or [2026, 2027, 2028])
+        line_items – list of dicts with name + per-year data
     """
     rows = _xlsx_bytes_to_rows(file_bytes)
     if not rows:
@@ -119,15 +120,43 @@ def parse_gl_bytes(file_bytes: bytes) -> dict | None:
 
     # Find the header row (contains "Line Item")
     header_idx = None
+    header_row = []
     for i, r in enumerate(rows):
         if any("Line Item" in c for c in r):
             header_idx = i
+            header_row = r
             break
 
     if header_idx is None or account is None:
         return None
 
-    # Line000 description
+    # Detect year columns from header
+    # Format: ..., "Comments YYYY", "YYYY", "YYYY-01", ..., "YYYY-12", ...
+    year_columns = {}  # year -> {'annual_col': int, 'monthly_start': int}
+    for ci, cell in enumerate(header_row):
+        cell = cell.strip()
+        m = re.match(r"^(\d{4})$", cell)
+        if m:
+            year = int(m.group(1))
+            # Check if next columns are monthly (YYYY-01, etc.)
+            if ci + 1 < len(header_row) and re.match(rf"^{year}-\d{{2}}$", header_row[ci + 1].strip()):
+                year_columns[year] = {'annual_col': ci, 'monthly_start': ci + 1}
+            else:
+                # Annual-only year (like 2027, 2028 in the original files)
+                year_columns[year] = {'annual_col': ci, 'monthly_start': None}
+
+    if not year_columns:
+        return None
+
+    # Primary year = first year with monthly data
+    primary_year = None
+    for y in sorted(year_columns.keys()):
+        if year_columns[y]['monthly_start'] is not None:
+            primary_year = y
+            break
+    if primary_year is None:
+        primary_year = min(year_columns.keys())
+
     desc = ""
     line_items = []
 
@@ -144,134 +173,32 @@ def parse_gl_bytes(file_bytes: bytes) -> dict | None:
             desc = name
             continue
 
-        # Skip empty items (no name and zero annual)
-        annual_2026 = _to_float(r[8]) if len(r) > 8 else 0
-        if not name and annual_2026 == 0:
+        # Get primary year annual
+        pcol = year_columns[primary_year]['annual_col']
+        primary_annual = _to_float(r[pcol]) if len(r) > pcol else 0
+        if not name and primary_annual == 0:
             continue
-
         if not name:
             continue
 
-        monthly_2026 = [_to_float(r[9 + i]) if len(r) > 9 + i else 0.0 for i in range(12)]
-        annual_2027 = _to_float(r[23]) if len(r) > 23 else 0.0
-        annual_2028 = _to_float(r[26]) if len(r) > 26 else 0.0
+        item = {"name": name}
+        for year, cols in sorted(year_columns.items()):
+            acol = cols['annual_col']
+            item[f"annual_{year}"] = _to_float(r[acol]) if len(r) > acol else 0.0
+            if cols['monthly_start'] is not None:
+                item[f"monthly_{year}"] = [
+                    _to_float(r[cols['monthly_start'] + m]) if len(r) > cols['monthly_start'] + m else 0.0
+                    for m in range(12)
+                ]
 
-        line_items.append({
-            "name": name,
-            "annual_2026": annual_2026,
-            "monthly_2026": monthly_2026,
-            "annual_2027": annual_2027,
-            "annual_2028": annual_2028,
-        })
+        line_items.append(item)
 
     return {
         "account": account,
         "desc": desc,
+        "years": sorted(year_columns.keys()),
         "line_items": line_items,
     }
-
-
-def parse_master_bytes(file_bytes: bytes) -> list[dict]:
-    """Parse Dept_44_Budget.xlsx for 2025 budget vs actual data."""
-    rows = _xlsx_bytes_to_rows(file_bytes)
-    if not rows:
-        return []
-
-    records = []
-    current_account = None
-    current_desc = None
-
-    for r in rows:
-        if len(r) < 3:
-            continue
-
-        # Detect category header rows (have account number in col 0)
-        if r[0].strip() and re.match(r"\d{4}\.\d{2}", r[0].strip()):
-            current_account = r[0].strip()
-            current_desc = r[1].strip() if len(r) > 1 else ""
-            # Category summary row – extract budget/actual per month
-            budgets = []
-            actuals = []
-            for m in range(12):
-                b_idx = 2 + m * 2
-                a_idx = 3 + m * 2
-                budgets.append(_to_float(r[b_idx]) if len(r) > b_idx else 0)
-                actuals.append(_to_float(r[a_idx]) if len(r) > a_idx else 0)
-            yearly_budget = _to_float(r[26]) if len(r) > 26 else sum(budgets)
-            yearly_actual = _to_float(r[27]) if len(r) > 27 else sum(actuals)
-            records.append({
-                "account": current_account,
-                "category": current_desc,
-                "line_item": "(Category Total)",
-                "is_category": True,
-                "monthly_budget": budgets,
-                "monthly_actual": actuals,
-                "yearly_budget": yearly_budget,
-                "yearly_actual": yearly_actual,
-            })
-            continue
-
-        # Detect sub-line items (no account number, name in col 0 or 1)
-        if current_account and not r[0].strip():
-            name = r[1].strip() if len(r) > 1 and r[1].strip() else ""
-            if not name:
-                name = r[0].strip()
-            if not name:
-                continue
-            if name in ("Account", "", "Net Income"):
-                continue
-
-            budgets = []
-            actuals = []
-            for m in range(12):
-                b_idx = 2 + m * 2
-                a_idx = 3 + m * 2
-                budgets.append(_to_float(r[b_idx]) if len(r) > b_idx else 0)
-                actuals.append(_to_float(r[a_idx]) if len(r) > a_idx else 0)
-
-            if sum(budgets) == 0 and sum(actuals) == 0:
-                continue
-
-            yearly_budget = _to_float(r[26]) if len(r) > 26 else sum(budgets)
-            yearly_actual = _to_float(r[27]) if len(r) > 27 else sum(actuals)
-            records.append({
-                "account": current_account,
-                "category": current_desc,
-                "line_item": name,
-                "is_category": False,
-                "monthly_budget": budgets,
-                "monthly_actual": actuals,
-                "yearly_budget": yearly_budget,
-                "yearly_actual": yearly_actual,
-            })
-        elif r[0].strip() and not re.match(r"\d{4}\.\d{2}", r[0].strip()):
-            if current_account:
-                name = r[0].strip()
-                if name in ("Account", "Net Income"):
-                    continue
-                budgets = []
-                actuals = []
-                for m in range(12):
-                    b_idx = 2 + m * 2
-                    a_idx = 3 + m * 2
-                    budgets.append(_to_float(r[b_idx]) if len(r) > b_idx else 0)
-                    actuals.append(_to_float(r[a_idx]) if len(r) > a_idx else 0)
-                if sum(budgets) == 0 and sum(actuals) == 0:
-                    continue
-                yearly_budget = _to_float(r[26]) if len(r) > 26 else sum(budgets)
-                yearly_actual = _to_float(r[27]) if len(r) > 27 else sum(actuals)
-                records.append({
-                    "account": current_account,
-                    "category": current_desc,
-                    "line_item": name,
-                    "is_category": False,
-                    "monthly_budget": budgets,
-                    "monthly_actual": actuals,
-                    "yearly_budget": yearly_budget,
-                    "yearly_actual": yearly_actual,
-                })
-
-    return records
 
 
 def category_label(account: str) -> str:
@@ -304,15 +231,15 @@ def _build_drive_service():
 
 
 @st.cache_data(ttl=300)
-def load_drive_data() -> tuple[dict, list]:
-    """Load all budget files from Google Drive folder, parse, and return (gl_data, actuals_2025).
+def load_drive_data() -> dict:
+    """Load all budget files from Google Drive folder, parse, and return gl_data.
 
+    Multiple files for the same GL account (e.g. 2025 actuals + 2026 budget) are merged.
     Cached for 5 minutes.
     """
     folder_id = st.secrets["google_drive"]["folder_id"]
     service = _build_drive_service()
 
-    # List all files in the folder
     results = service.files().list(
         q=f"'{folder_id}' in parents and trashed = false",
         fields="files(id, name, mimeType)",
@@ -321,15 +248,12 @@ def load_drive_data() -> tuple[dict, list]:
     files = results.get("files", [])
 
     gl_data = {}
-    actuals_2025 = []
     export_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
     for f in files:
-        name = f["name"]
         file_id = f["id"]
         mime = f["mimeType"]
 
-        # Export Google Sheets as xlsx; download xlsx files directly
         if mime == "application/vnd.google-apps.spreadsheet":
             resp = service.files().export(fileId=file_id, mimeType=export_mime).execute()
         elif mime == export_mime:
@@ -338,32 +262,39 @@ def load_drive_data() -> tuple[dict, list]:
             continue
 
         file_bytes = resp if isinstance(resp, bytes) else resp.encode("latin-1")
+        parsed = parse_gl_bytes(file_bytes)
+        if parsed:
+            acct = parsed["account"]
+            if acct in gl_data:
+                existing = gl_data[acct]
+                existing["line_items"].extend(parsed["line_items"])
+                existing["years"] = sorted(set(existing["years"]) | set(parsed["years"]))
+            else:
+                gl_data[acct] = parsed
 
-        # Determine if this is the master budget file
-        if MASTER_FILE_NAME.lower() in name.lower():
-            actuals_2025 = parse_master_bytes(file_bytes)
-        else:
-            parsed = parse_gl_bytes(file_bytes)
-            if parsed:
-                gl_data[parsed["account"]] = parsed
-
-    return gl_data, actuals_2025
+    return gl_data
 
 
-def _process_files(file_data: dict[str, bytes]) -> tuple[dict, list]:
-    """Parse all files and return (gl_data dict, actuals_2025 list)."""
+def _process_files(file_data: dict[str, bytes]) -> dict:
+    """Parse all files and return gl_data dict keyed by account.
+    
+    Multiple files for the same account are merged (line items combined).
+    """
     gl_data = {}
-    actuals_2025 = []
 
     for fname, fbytes in sorted(file_data.items()):
-        if fname == "Dept_44_Budget.xlsx":
-            actuals_2025 = parse_master_bytes(fbytes)
-        else:
-            parsed = parse_gl_bytes(fbytes)
-            if parsed:
-                gl_data[parsed["account"]] = parsed
+        parsed = parse_gl_bytes(fbytes)
+        if parsed:
+            acct = parsed["account"]
+            if acct in gl_data:
+                # Merge: combine line items and years
+                existing = gl_data[acct]
+                existing["line_items"].extend(parsed["line_items"])
+                existing["years"] = sorted(set(existing["years"]) | set(parsed["years"]))
+            else:
+                gl_data[acct] = parsed
 
-    return gl_data, actuals_2025
+    return gl_data
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +324,7 @@ if not has_secrets:
     st.stop()
 
 try:
-    gl_data, actuals_2025 = load_drive_data()
+    gl_data = load_drive_data()
 except Exception as e:
     st.error(f"**Failed to load data from Google Drive:** {e}")
     st.stop()
@@ -405,33 +336,23 @@ if not gl_data:
     )
     st.stop()
 
-# Build 2025 actuals lookup by account
-actuals_by_account = {}
-for r in actuals_2025:
-    if r["is_category"]:
-        actuals_by_account[r["account"]] = {
-            "budget": r["yearly_budget"],
-            "actual": r["yearly_actual"],
-            "monthly_budget": r["monthly_budget"],
-            "monthly_actual": r["monthly_actual"],
-        }
+# Collect all years across all GL files
+all_years = set()
+for acct, info in gl_data.items():
+    all_years.update(info.get("years", []))
+all_years = sorted(all_years)
 
 # Build summary DataFrames
 summary_rows = []
 for acct, info in sorted(gl_data.items()):
-    total_2026 = sum(li["annual_2026"] for li in info["line_items"])
-    total_2027 = sum(li["annual_2027"] for li in info["line_items"])
-    total_2028 = sum(li["annual_2028"] for li in info["line_items"])
-    actual_2025 = actuals_by_account.get(acct, {}).get("actual", 0)
-    summary_rows.append({
+    row = {
         "account": acct,
         "category": category_label(acct),
         "short_name": GL_NAMES.get(acct, acct),
-        "2025": actual_2025,
-        "2026": total_2026,
-        "2027": total_2027,
-        "2028": total_2028,
-    })
+    }
+    for year in all_years:
+        row[str(year)] = sum(li_annual(li, year) for li in info["line_items"])
+    summary_rows.append(row)
 
 df_summary = pd.DataFrame(summary_rows)
 
@@ -447,12 +368,12 @@ with st.sidebar:
 
     page = st.radio(
         "Navigate",
-        ["Budget Overview", "Monthly View", "Line Item Detail", "2025 Budget vs Actual"],
+        ["Budget Overview", "Monthly View", "Line Item Detail"],
         index=0,
     )
 
     st.divider()
-    selected_year = st.selectbox("Year", [2025, 2026, 2027, 2028], index=1)
+    selected_year = st.selectbox("Year", all_years, index=min(1, len(all_years) - 1))
 
     # Build mapping: short name -> account number
     _name_to_acct = {GL_NAMES.get(a, a): a for a in sorted(gl_data.keys())}
@@ -479,13 +400,14 @@ if page == "Budget Overview":
     st.title("Budget Overview")
 
     # Summary cards
-    cols = st.columns(4)
-    for col, year in zip(cols, ["2025", "2026", "2027", "2028"]):
-        val = df_filtered[year].sum()
-        prev_val = df_filtered[str(int(year) - 1)].sum() if int(year) > 2025 else None
+    year_strs = [str(y) for y in all_years]
+    cols = st.columns(len(year_strs))
+    for col, year_s in zip(cols, year_strs):
+        val = df_filtered[year_s].sum()
+        prev_s = str(int(year_s) - 1)
+        prev_val = df_filtered[prev_s].sum() if prev_s in df_filtered.columns else None
         delta = f"${val - prev_val:+,.0f}" if prev_val is not None else None
-        label = f"{year} Actual" if year == "2025" else f"{year} Budget"
-        col.metric(label, f"${val:,.0f}", delta=delta)
+        col.metric(f"{year_s} Budget", f"${val:,.0f}", delta=delta)
 
     st.divider()
 
@@ -546,18 +468,12 @@ if page == "Budget Overview":
             drill_acct = drill_options[drill_options["name"] == drill_choice]["account"].iloc[0]
 
             if drill_acct in gl_data:
+                info = gl_data[drill_acct]
                 li_data = []
-                if selected_year == 2025:
-                    acct_items = [r for r in actuals_2025 if r["account"] == drill_acct and not r["is_category"]]
-                    for r in acct_items:
-                        if r["yearly_actual"] > 0:
-                            li_data.append({"Line Item": r["line_item"], "Budget": r["yearly_actual"]})
-                else:
-                    info = gl_data[drill_acct]
-                    for li in info["line_items"]:
-                        annual = li_annual(li, selected_year)
-                        if annual > 0:
-                            li_data.append({"Line Item": li["name"], "Budget": annual})
+                for li in info["line_items"]:
+                    annual = li_annual(li, selected_year)
+                    if annual > 0:
+                        li_data.append({"Line Item": li["name"], "Budget": annual})
 
                 if li_data:
                     df_drill = pd.DataFrame(li_data).sort_values("Budget", ascending=False)
@@ -584,13 +500,15 @@ if page == "Budget Overview":
 
     # Year-over-year comparison
     st.subheader("Year-over-Year Comparison")
-    df_yoy = df_filtered[["short_name", "2025", "2026", "2027", "2028"]].melt(
+    yoy_cols = ["short_name"] + [str(y) for y in all_years]
+    df_yoy = df_filtered[yoy_cols].melt(
         id_vars="short_name", var_name="Year", value_name="Budget"
     )
+    yoy_colors = ["#2ED573", "#5B8DEF", "#F7B731", "#FC5C65"][:len(all_years)]
     fig_yoy = px.bar(
         df_yoy, x="short_name", y="Budget", color="Year",
         barmode="group",
-        color_discrete_sequence=["#2ED573", "#5B8DEF", "#F7B731", "#FC5C65"],
+        color_discrete_sequence=yoy_colors,
         labels={"short_name": "Category", "Budget": "Budget ($)"},
         text_auto="$,.0f",
     )
@@ -612,17 +530,13 @@ elif page == "Monthly View":
             continue
         info = gl_data[acct]
         monthly_totals = [0.0] * 12
-        if selected_year == 2025:
-            # Use actuals from master file
-            acct_data = actuals_by_account.get(acct, {})
-            monthly_totals = list(acct_data.get("monthly_actual", [0.0] * 12))
-        elif selected_year == 2026:
-            for li in info["line_items"]:
+        monthly_key = f"monthly_{selected_year}"
+        for li in info["line_items"]:
+            if monthly_key in li:
                 for m in range(12):
-                    monthly_totals[m] += li["monthly_2026"][m]
-        else:
-            for li in info["line_items"]:
-                # 2027/2028 only have annual totals, spread evenly
+                    monthly_totals[m] += li[monthly_key][m]
+            else:
+                # Year only has annual total, spread evenly
                 annual = li_annual(li, selected_year)
                 for m in range(12):
                     monthly_totals[m] += annual / 12
@@ -691,47 +605,29 @@ elif page == "Line Item Detail":
             continue
         info = gl_data[acct]
         label = category_label(acct)
-        if selected_year == 2025:
-            acct_actual = actuals_by_account.get(acct, {}).get("actual", 0)
-            total = acct_actual
-        else:
-            total = sum(li_annual(li, selected_year) for li in info["line_items"])
+        total = sum(li_annual(li, selected_year) for li in info["line_items"])
 
         with st.expander(f"{label}  —  ${total:,.0f}", expanded=False):
             rows = []
+            monthly_key = f"monthly_{selected_year}"
 
-            if selected_year == 2025:
-                # Pull line items from 2025 actuals
-                acct_line_items = [r for r in actuals_2025 if r["account"] == acct and not r["is_category"]]
-                for r in acct_line_items:
-                    row = {"Line Item": r["line_item"], "Annual": r["yearly_actual"]}
+            for li in info["line_items"]:
+                annual = li_annual(li, selected_year)
+                if annual == 0 and not li["name"]:
+                    continue
+                row = {"Line Item": li["name"], "Annual": annual}
+                if monthly_key in li:
                     for m in range(12):
-                        row[MONTH_LABELS[m]] = r["monthly_actual"][m]
-                    row["Budget"] = r["yearly_budget"]
-                    row["Variance"] = r["yearly_budget"] - r["yearly_actual"]
-                    rows.append(row)
-            else:
-                for li in info["line_items"]:
-                    annual = li_annual(li, selected_year)
-                    if annual == 0 and not li["name"]:
-                        continue
-                    row = {"Line Item": li["name"], "Annual": annual}
-                    if selected_year == 2026:
-                        for m in range(12):
-                            row[MONTH_LABELS[m]] = li["monthly_2026"][m]
-                    else:
-                        for m in range(12):
-                            row[MONTH_LABELS[m]] = annual / 12
+                        row[MONTH_LABELS[m]] = li[monthly_key][m]
+                else:
+                    for m in range(12):
+                        row[MONTH_LABELS[m]] = annual / 12
 
-                    # YoY change
-                    prev_year = selected_year - 1
-                    if prev_year >= 2026:
-                        prev = li_annual(li, prev_year)
-                        change = annual - prev
-                        row["YoY Change"] = change
-                    elif selected_year == 2026:
-                        row["vs 2027"] = li_annual(li, 2027) - annual
-                        row["vs 2028"] = li_annual(li, 2028) - annual
+                # YoY change vs previous year if available
+                prev_year = selected_year - 1
+                if str(prev_year) in df_summary.columns:
+                    prev = li_annual(li, prev_year)
+                    row["YoY Change"] = annual - prev
 
                 rows.append(row)
 
@@ -777,20 +673,20 @@ elif page == "Line Item Detail":
         if acct not in gl_data:
             continue
         info = gl_data[acct]
-        t25 = actuals_by_account.get(acct, {}).get("actual", 0)
-        t26 = sum(li["annual_2026"] for li in info["line_items"])
-        t27 = sum(li["annual_2027"] for li in info["line_items"])
-        t28 = sum(li["annual_2028"] for li in info["line_items"])
-        yoy_rows.append({
-            "Category": GL_NAMES.get(acct, acct),
-            "2025": t25,
-            "2026": t26,
-            "2027": t27,
-            "2028": t28,
-            "25→26": t26 - t25,
-            "26→27": t27 - t26,
-            "27→28": t28 - t27,
-        })
+        info = gl_data[acct]
+        row_data = {"Category": GL_NAMES.get(acct, acct)}
+        year_totals = {}
+        for y in all_years:
+            t = sum(li_annual(li, y) for li in info["line_items"])
+            row_data[str(y)] = t
+            year_totals[y] = t
+        for i in range(1, len(all_years)):
+            prev_y = all_years[i - 1]
+            curr_y = all_years[i]
+            short_prev = str(prev_y)[-2:]
+            short_curr = str(curr_y)[-2:]
+            row_data[f"{short_prev}→{short_curr}"] = year_totals[curr_y] - year_totals[prev_y]
+        yoy_rows.append(row_data)
     df_yoy = pd.DataFrame(yoy_rows)
     totals = df_yoy.select_dtypes(include="number").sum()
     totals["Category"] = "TOTAL"
@@ -811,163 +707,3 @@ elif page == "Line Item Detail":
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
 
-# ---------------------------------------------------------------------------
-# Page 4: 2025 Actuals
-# ---------------------------------------------------------------------------
-elif page == "2025 Budget vs Actual":
-    st.title("2025 Budget vs Actuals")
-
-    if not actuals_2025:
-        st.warning("Could not load 2025 actuals data. Make sure the 'Dept 44 Budget' file is in the Google Drive folder.")
-    else:
-        # Category-level summary
-        cat_records = [r for r in actuals_2025 if r["is_category"]]
-
-        st.subheader("Variance Analysis by Category")
-        var_rows = []
-        for r in cat_records:
-            budget = r["yearly_budget"]
-            actual = r["yearly_actual"]
-            variance = budget - actual
-            util = (actual / budget * 100) if budget else 0
-            var_rows.append({
-                "Account": r["account"],
-                "Category": r["category"],
-                "Budget": budget,
-                "Actual": actual,
-                "Variance": variance,
-                "Utilization": util,
-            })
-
-        df_var = pd.DataFrame(var_rows)
-
-        # Summary cards
-        total_budget = df_var["Budget"].sum()
-        total_actual = df_var["Actual"].sum()
-        total_variance = total_budget - total_actual
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Budget", f"${total_budget:,.0f}")
-        c2.metric("Total Actual", f"${total_actual:,.0f}")
-        c3.metric("Total Variance", f"${total_variance:,.0f}",
-                  delta=f"{'Under' if total_variance > 0 else 'Over'} budget")
-        c4.metric("Utilization", f"{total_actual / total_budget * 100:.1f}%" if total_budget else "N/A")
-
-        st.divider()
-
-        # Budget vs Actual grouped bar
-        col_l, col_r = st.columns(2)
-
-        with col_l:
-            st.subheader("Budget vs Actual by Category")
-            df_bva = df_var[["Category", "Budget", "Actual"]].melt(
-                id_vars="Category", var_name="Type", value_name="Amount"
-            )
-            df_bva["Category"] = df_bva["Category"].str.replace(
-                r"^CC - |^GP Comp - ", "", regex=True
-            ).str[:35]
-            fig_bva = px.bar(
-                df_bva, x="Category", y="Amount", color="Type",
-                barmode="group",
-                color_discrete_map={"Budget": "#5B8DEF", "Actual": "#F7B731"},
-                text_auto="$,.0f",
-            )
-            fig_bva.update_layout(**PLOTLY_LAYOUT, height=450)
-            fig_bva.update_traces(textposition="outside", textfont_size=9)
-            fig_bva.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_bva, use_container_width=True)
-
-        with col_r:
-            st.subheader("Utilization Rate")
-            df_util = df_var[["Category", "Utilization"]].copy()
-            df_util["Category"] = df_util["Category"].str.replace(
-                r"^CC - |^GP Comp - ", "", regex=True
-            ).str[:35]
-            df_util = df_util.sort_values("Utilization")
-            df_util["Color"] = df_util["Utilization"].apply(
-                lambda x: "#FC5C65" if x > 100 else "#2ED573" if x < 80 else "#F7B731"
-            )
-            fig_util = px.bar(
-                df_util, x="Utilization", y="Category", orientation="h",
-                color="Color",
-                color_discrete_map="identity",
-                text_auto=".1f",
-            )
-            fig_util.update_layout(**PLOTLY_LAYOUT, height=450, showlegend=False)
-            fig_util.update_traces(texttemplate="%{x:.1f}%", textposition="outside")
-            fig_util.add_vline(x=100, line_dash="dash", line_color="#FAFAFA", opacity=0.4)
-            st.plotly_chart(fig_util, use_container_width=True)
-
-        # Monthly budget vs actual trend
-        st.subheader("Monthly Budget vs Actual Trend")
-        monthly_b = [0.0] * 12
-        monthly_a = [0.0] * 12
-        for r in cat_records:
-            for m in range(12):
-                monthly_b[m] += r["monthly_budget"][m]
-                monthly_a[m] += r["monthly_actual"][m]
-
-        df_trend = pd.DataFrame({
-            "Month": MONTH_LABELS,
-            "Budget": monthly_b,
-            "Actual": monthly_a,
-        })
-        fig_trend = go.Figure()
-        fig_trend.add_trace(go.Scatter(
-            x=df_trend["Month"], y=df_trend["Budget"],
-            name="Budget", line=dict(color="#5B8DEF", width=3),
-            mode="lines+markers",
-        ))
-        fig_trend.add_trace(go.Scatter(
-            x=df_trend["Month"], y=df_trend["Actual"],
-            name="Actual", line=dict(color="#F7B731", width=3),
-            mode="lines+markers",
-        ))
-        fig_trend.update_layout(**PLOTLY_LAYOUT, height=350)
-        st.plotly_chart(fig_trend, use_container_width=True)
-
-        # Line item detail table
-        st.subheader("Line Item Utilization")
-        li_records = [r for r in actuals_2025 if not r["is_category"]]
-        li_rows = []
-        for r in li_records:
-            budget = r["yearly_budget"]
-            actual = r["yearly_actual"]
-            variance = budget - actual
-            util = (actual / budget * 100) if budget else (100 if actual > 0 else 0)
-            li_rows.append({
-                "Account": r["account"],
-                "Category": r["category"],
-                "Line Item": r["line_item"],
-                "Budget": budget,
-                "Actual": actual,
-                "Variance": variance,
-                "Util %": util,
-            })
-
-        df_li = pd.DataFrame(li_rows)
-
-        def color_variance(val):
-            if not isinstance(val, (int, float)):
-                return ""
-            if val < 0:
-                return "color: #FC5C65"
-            elif val > 0:
-                return "color: #2ED573"
-            return ""
-
-        def color_util(val):
-            if not isinstance(val, (int, float)):
-                return ""
-            if val > 100:
-                return "color: #FC5C65"
-            elif val < 50:
-                return "color: #2ED573"
-            return ""
-
-        fmt = {"Budget": "${:,.2f}", "Actual": "${:,.2f}", "Variance": "${:,.2f}", "Util %": "{:.1f}%"}
-        styled = (df_li.style
-                  .format(fmt)
-                  .map(color_variance, subset=["Variance"])
-                  .map(color_util, subset=["Util %"]))
-        st.dataframe(styled, use_container_width=True, hide_index=True, height=500)
