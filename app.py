@@ -435,11 +435,13 @@ with st.sidebar:
     st.divider()
     selected_year = st.selectbox("Year", [2026, 2027, 2028], index=0)
 
-    all_categories = [category_label(a) for a in sorted(gl_data.keys())]
-    selected_categories = st.multiselect(
+    # Build mapping: short name -> account number
+    _name_to_acct = {GL_NAMES.get(a, a): a for a in sorted(gl_data.keys())}
+    all_short_names = list(_name_to_acct.keys())
+    selected_names = st.multiselect(
         "Filter Categories",
-        all_categories,
-        default=all_categories,
+        all_short_names,
+        default=all_short_names,
     )
 
     st.divider()
@@ -447,9 +449,7 @@ with st.sidebar:
     st.metric("Total Budget", f"${total_budget:,.0f}", delta=None)
 
 # Filter helper
-filtered_accounts = [
-    c.split(" – ")[0] for c in selected_categories
-]
+filtered_accounts = [_name_to_acct[n] for n in selected_names if n in _name_to_acct]
 df_filtered = df_summary[df_summary["account"].isin(filtered_accounts)]
 
 
