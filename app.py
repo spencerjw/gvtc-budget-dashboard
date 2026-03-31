@@ -8,6 +8,26 @@ import re
 import json
 
 # ---------------------------------------------------------------------------
+# Password Gate
+# ---------------------------------------------------------------------------
+def check_password():
+    """Block access until correct password is entered."""
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+    if not st.session_state.authenticated:
+        st.markdown("## GVTC Dept 44 Budget Dashboard")
+        st.markdown("This dashboard contains confidential financial data.")
+        pwd = st.text_input("Enter password to continue", type="password")
+        if pwd and pwd == st.secrets.get("app_password", ""):
+            st.session_state.authenticated = True
+            st.rerun()
+        elif pwd:
+            st.error("Incorrect password")
+        st.stop()
+
+check_password()
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 st.set_page_config(
