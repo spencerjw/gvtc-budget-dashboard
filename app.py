@@ -521,6 +521,16 @@ def short_name(acct: str) -> str:
 if page == "Budget Overview":
     st.title("Budget Overview")
 
+    # Last updated tag — derived from the most recent variance report in the Drive folder
+    if latest_vr:
+        st.markdown(
+            f"<span style='background-color:#1A1D23; border:1px solid #3A3D45; "
+            f"border-radius:4px; padding:3px 10px; font-size:0.78rem; color:#9BA3AF;'>"
+            f"📅 Data through {latest_vr['month_label']} {latest_vr['year']}</span>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("")
+
     # Top-level KPIs
     if latest_vr:
         ytd = latest_vr["ytd_total"]
